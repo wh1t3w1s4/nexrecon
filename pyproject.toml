@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexrecon"
+version = "0.1.0"
+description = "Herramienta de reconocimiento web (recon automatizado, análisis de postura de seguridad)"
+authors = [{ name = "w1s4" }]
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "urllib3>=2.0",
+    "dnspython>=2.6",
+    "beautifulsoup4>=4.12",
+    "packaging>=24.0",
+    "rich>=13.7",
+]
+
+[project.scripts]
+nexrecon = "nexrecon.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["nexrecon*"]

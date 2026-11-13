@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-import-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint (ruff)
+        run: ruff check nexrecon/
+
+      - name: Compile check (todos los .py)
+        run: python -m compileall -q nexrecon/
+
+      - name: Import real de todos los módulos
+        run: |
+          python -c "
+          import importlib, pkgutil, nexrecon
+          for _, name, _ in pkgutil.walk_packages(nexrecon.__path__, nexrecon.__name__ + '.'):
+              importlib.import_module(name)
+              print('OK:', name)
+          "

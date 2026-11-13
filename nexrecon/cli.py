@@ -1,0 +1,522 @@
+"""Orquestador principal. Equivalente al cuerpo del script bash, pero:
+
+- Fases independientes (IP info, subdominios) se paralelizan con
+  ThreadPoolExecutor en vez de ejecutarse en fila.
+- Cada subdominio vivo se evalúa en paralelo durante la comparación de
+  postura (en bash era un `for` secuencial que repetía whatweb+curl+wafw00f
+  uno detrás de otro).
+- `rich` sustituye a los códigos ANSI manuales para banner, colores y
+  la tabla comparativa final (alineación automática, sin el problema de
+  ancho de columna con símbolos Unicode que tuvimos en bash).
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+from rich.console import Console
+from rich.table import Table
+
+from . import config
+from .http_client import HttpClient
+from .models import HostResult, ScanResult, Severity
+from .modules import (
+    bypass403, dns_recon, fingerprint, fuzzing, headers_cookies,
+    ip_intel, nuclei_scan, posture, subdomains, vuln_db, waf_wordpress,
+)
+from .report import json_report, markdown_report
+
+console = Console()
+
+
+def print_banner() -> None:
+    console.print("[bold cyan]Nexrecon[/bold cyan] [yellow]v0.1.0[/yellow] — by w1s4")
+    console.print("[dim]Reconocimiento web para auditorías autorizadas[/dim]\n")
+
+
+def detect_protocol(client: HttpClient, domain: str) -> str | None:
+    for scheme in ("https", "http"):
+        status = client.status_only(f"{scheme}://{domain}")
+        if 200 <= status < 500:
+            return scheme
+    return None
+
+
+def parse_robots(client: HttpClient, base_url: str) -> list[str]:
+    """Extrae Allow/Disallow de robots.txt.
+
+    Tolera la ausencia de espacio tras los dos puntos (`Disallow:/admin`),
+    comentarios, líneas vacías y respuestas que no son 200 — antes un 404
+    se parseaba como si fuera un robots.txt válido.
+    """
+    result = client.get(f"{base_url}/robots.txt")
+    if not result.ok or result.status_code != 200:
+        return []
+
+    paths: list[str] = []
+    for raw in result.text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        directive, sep, value = line.partition(":")
+        if not sep or directive.strip().lower() not in ("allow", "disallow"):
+            continue
+        value = value.strip()
+        if value:
+            paths.append(value)
+    return paths
+
+
+def run_phase1(client: HttpClient, result: ScanResult, subdomain_mode: bool) -> None:
+    console.rule("[bold]Fase 1 — Reconocimiento pasivo[/bold]")
+
+    if not subdomain_mode:
+        console.print("[green][+] WHOIS[/green]")
+        result.whois_raw = ip_intel.run_whois(result.target)
+
+        console.print("[green][+] Registros DNS[/green]")
+        result.dns_records = dns_recon.full_dns_recon(result.target)
+
+        ns_recordset = result.dns_records.get("NS")
+        if ns_recordset and ns_recordset.values:
+            console.print("[green][+] Probando transferencia de zona (AXFR)[/green]")
+            result.axfr_attempted = True
+            result.axfr_results = dns_recon.attempt_axfr(result.target, ns_recordset.values)
+            if result.axfr_results:
+                console.print(
+                    f"[bold red][!] AXFR exitoso contra {len(result.axfr_results)} "
+                    f"nameserver(s) — zona filtrada[/bold red]"
+                )
+            else:
+                console.print("[dim]  AXFR: sin éxito (configuración correcta)[/dim]")
+
+    console.print("[green][+] Resolución A y geolocalización[/green]")
+    ips = dns_recon.resolve_a(result.target)
+    result.ip_addresses = ips[: config.MAX_IPS_TO_ANALYZE]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(ip_intel.query_internetdb, client, ip): ip
+            for ip in result.ip_addresses
+        }
+        for future in as_completed(futures):
+            result.ip_intel.append(future.result())
+
+
+def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None,
+                  run_fuzzing: bool = True, verbose: bool = True,
+                  deep: bool = False, use_nuclei: bool = False) -> HostResult:
+    """Ejecuta todos los módulos de Fase 2 contra un host.
+
+    `protocol=None` hace que se detecte por host: un subdominio puede
+    servir solo HTTP aunque el dominio raíz vaya por HTTPS, y antes se
+    evaluaba con el esquema equivocado.
+
+    `verbose=True` (por defecto, usado para el host raíz) muestra un
+    spinner por paso con console.status() — mismo propósito que el
+    patrón de spinner que montamos a mano en bash para wpscan, aquí
+    viene integrado en rich. `verbose=False` se usa al evaluar los
+    subdominios en paralelo, donde un spinner por hilo generaría ruido
+    visual superpuesto; ahí solo se imprime el resultado final de cada uno.
+
+    `deep=True` (flag -d/--deep) usa la wordlist grande (big.txt en vez
+    de common.txt) con más margen de tiempo, y wpscan en modo "mixed"
+    (barrido activo) en vez de "passive". `use_nuclei=True` (flag
+    --nuclei, o automático bajo --deep) añade un escaneo de templates
+    de nuclei — la pieza más ruidosa de todas, por eso nunca se activa
+    por defecto.
+    """
+    if protocol is None:
+        protocol = detect_protocol(client, hostname)
+        if protocol is None:
+            host = HostResult(hostname=hostname)
+            host.add_finding("El host no responde por HTTP ni HTTPS",
+                             Severity.INFO, module="cli")
+            posture.compute_score(host)
+            return host
+
+    host = HostResult(hostname=hostname, protocol=protocol)
+    base_url = f"{protocol}://{hostname}"
+
+    def step(label: str, fn, *args):
+        if verbose:
+            with console.status(f"[cyan]{label}...[/cyan]"):
+                return fn(*args)
+        return fn(*args)
+
+    ww_output = step("Fingerprinting (whatweb)", fingerprint.run_whatweb, base_url)
+    if fingerprint.is_cloudflare_block(ww_output):
+        host.add_finding("Cloudflare challenge detectado", Severity.INFO,
+                          "whatweb omitido para este host.", module="whatweb")
+        if verbose:
+            console.print("[yellow][-] Cloudflare detectado, whatweb omitido[/yellow]")
+    else:
+        host.technologies = fingerprint.extract_technologies(ww_output)
+        if verbose and host.technologies:
+            techs = ", ".join(
+                f"{k} {v}".strip() for k, v in host.technologies.items()
+            )
+            console.print("[green][+] Tecnologías:[/green]", techs)
+
+    step("Analizando cabeceras y cookies", headers_cookies.analyze, client, host, base_url)
+    host.vulns = vuln_db.check_technologies(host)
+    if verbose:
+        if host.vulns:
+            console.print(f"[red][!] {len(host.vulns)} vulnerabilidad(es) conocidas por versión[/red]")
+        else:
+            console.print("[green][+] Sin vulnerabilidades conocidas por versión[/green]")
+
+    host.waf = step("Detectando WAF", waf_wordpress.detect_waf, base_url)
+    if verbose:
+        console.print("[green][+] WAF:[/green]", host.waf or "no detectado")
+
+    if waf_wordpress.is_wordpress(ww_output):
+        if not waf_wordpress.wpscan_available():
+            host.add_finding("wpscan no está instalado, se omite", Severity.INFO,
+                              "Instálalo con: gem install wpscan", module="wordpress")
+            if verbose:
+                console.print("[yellow][-] wpscan no encontrado, se omite[/yellow]")
+        else:
+            wp_mode = config.WPSCAN_MODE_DEEP if deep else config.WPSCAN_MODE_DEFAULT
+            wp_timeout = config.WPSCAN_TIMEOUT_DEEP if deep else config.WPSCAN_TIMEOUT_DEFAULT
+            if verbose:
+                console.print(
+                    f"[green][+] WordPress detectado, lanzando wpscan en modo "
+                    f"'{wp_mode}' (timeout {wp_timeout}s)[/green]"
+                )
+            host.wordpress = step(
+                "wpscan en curso", waf_wordpress.run_wpscan, base_url, wp_timeout, wp_mode
+            )
+            # Superficie explícita del resultado: antes un timeout o un fallo
+            # de wpscan quedaba indistinguible de "corrió bien y no encontró
+            # nada", y en el reporte salía un bloque vacío sin explicación.
+            if host.wordpress.get("timed_out"):
+                host.add_finding(
+                    "wpscan se agotó por tiempo", Severity.INFO,
+                    f"Sin resultados tras {wp_timeout}s. Prueba con --deep "
+                    "(más timeout) o revisa la conexión al target.",
+                    module="wordpress",
+                )
+                if verbose:
+                    console.print(f"[yellow][-] wpscan: timeout a los {wp_timeout}s, sin resultados[/yellow]")
+            elif host.wordpress.get("error"):
+                host.add_finding(
+                    "wpscan falló", Severity.INFO, host.wordpress["error"], module="wordpress",
+                )
+                if verbose:
+                    console.print(f"[yellow][-] wpscan: {host.wordpress['error']}[/yellow]")
+            elif verbose:
+                raw = host.wordpress.get("raw", "")
+                if raw:
+                    console.print(f"[green][+] wpscan: {len(raw.splitlines())} líneas de salida (ver reporte)[/green]")
+                else:
+                    console.print("[dim]  wpscan: sin hallazgos relevantes en modo passive[/dim]")
+
+    if use_nuclei:
+        if not nuclei_scan.nuclei_available():
+            host.add_finding("nuclei no está instalado, se omite", Severity.INFO,
+                              "Instálalo con: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+                              module="nuclei")
+            if verbose:
+                console.print("[yellow][-] nuclei no encontrado, se omite[/yellow]")
+        else:
+            if verbose:
+                console.print("[green][+] Ejecutando nuclei (puede tardar varios minutos)[/green]")
+            raw_nuclei = step("nuclei en curso", nuclei_scan.run_nuclei, base_url)
+            nuclei_findings = nuclei_scan.findings_from_nuclei(raw_nuclei)
+            host.findings.extend(nuclei_findings)
+            if verbose:
+                if nuclei_findings:
+                    console.print(f"[red][!] nuclei: {len(nuclei_findings)} hallazgo(s)[/red]")
+                else:
+                    console.print("[green][+] nuclei: sin hallazgos[/green]")
+
+    if run_fuzzing:
+        wordlist = config.WORDLIST_DEEP if deep else config.WORDLIST_DEFAULT
+        max_seconds = config.FFUF_MAX_SECONDS_DEEP if deep else config.FFUF_MAX_SECONDS
+        if verbose:
+            console.print(
+                f"[green][+] Iniciando fuzzing de directorios con "
+                f"{Path(wordlist).name} a {config.FFUF_THREADS_DEFAULT} hilos (puede tardar)[/green]"
+            )
+        try:
+            run = step("Fuzzing con ffuf", fuzzing.fuzz, base_url, wordlist, max_seconds)
+        except FileNotFoundError as exc:
+            run = fuzzing.FuzzRun(results=[])
+            host.add_finding("Fuzzing omitido", Severity.INFO, str(exc), module="fuzzing")
+            if verbose:
+                console.print(f"[yellow][-] Fuzzing omitido: {exc}[/yellow]")
+
+        if run.truncated:
+            host.add_finding(
+                "Fuzzing truncado por tiempo", Severity.INFO,
+                f"ffuf se detuvo a los {max_seconds}s; el listado puede estar incompleto.",
+                module="fuzzing",
+            )
+
+        if run.retried_with_fewer_threads:
+            host.add_finding(
+                "Posible rate-limit durante el fuzzing", Severity.INFO,
+                f"{run.rate_limit_hits_first_pass} respuestas de bloqueo "
+                f"(429/500/502/503/504/508) con {config.FFUF_THREADS_DEFAULT} hilos; "
+                f"se reintentó con {config.FFUF_THREADS_THROTTLED}. Si persiste, "
+                "considera bajar FFUF_THREADS_DEFAULT para ser más sigiloso.",
+                module="fuzzing",
+            )
+            if verbose:
+                console.print(
+                    f"[yellow][!] Rate-limit detectado ({run.rate_limit_hits_first_pass} "
+                    f"respuestas de bloqueo), reintentado con {config.FFUF_THREADS_THROTTLED} hilos[/yellow]"
+                )
+
+        clean, suspicious, forbidden = fuzzing.classify_results(run.results)
+        host.directories_clean = clean
+        host.directories_suspicious = suspicious
+        if verbose:
+            console.print(
+                f"[green][+] {len(clean)} resultados limpios, "
+                f"{len(suspicious)} descartados como ruido[/green]"
+            )
+
+        if forbidden:
+            if verbose:
+                console.print(f"[yellow][!] Probando bypass sobre {len(forbidden)} rutas con 403[/yellow]")
+            bypass_hits = []
+            for url in forbidden:
+                path = url.replace(base_url, "", 1)
+                bypass_hits += bypass403.test_bypass(client, base_url, path)
+            host.forbidden_bypassed = bypass_hits
+            if verbose and bypass_hits:
+                console.print(f"[red][!] {len(bypass_hits)} bypass(es) conseguidos[/red]")
+
+    posture.compute_score(host)
+    if verbose:
+        console.print(f"[bold green][+] Score de postura: {host.score}/100[/bold green]")
+    return host
+
+
+def run_phase2(client: HttpClient, result: ScanResult, subdomain_mode: bool,
+               deep: bool = False, use_nuclei: bool = False) -> None:
+    console.rule("[bold]Fase 2 — Reconocimiento activo[/bold]")
+
+    protocol = detect_protocol(client, result.target)
+    if not protocol:
+        console.print(f"[yellow][-] {result.target} no responde por HTTP ni HTTPS[/yellow]")
+        return
+
+    console.print(f"[green][+] Protocolo detectado: {protocol}[/green]\n")
+    root_host = evaluate_host(client, result.target, protocol,
+                               deep=deep, use_nuclei=use_nuclei)
+    result.hosts[result.target] = root_host
+
+    if result.axfr_results:
+        for ns, records in result.axfr_results.items():
+            root_host.add_finding(
+                f"Transferencia de zona (AXFR) exitosa contra {ns}",
+                Severity.CRITICAL,
+                f"{len(records)} registros de la zona expuestos sin autenticación.",
+                module="dns",
+            )
+        posture.compute_score(root_host)
+
+    result.robots_paths = parse_robots(client, f"{protocol}://{result.target}")
+
+    if subdomain_mode:
+        return
+
+    console.rule("Descubrimiento de subdominios")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_subfinder = pool.submit(subdomains.run_subfinder, result.target)
+        f_crtsh = pool.submit(subdomains.query_crtsh, client, result.target)
+        f_shodan = pool.submit(subdomains.scrape_shodan, client, result.target)
+        subs_sf, subs_crt, subs_sh = (
+            f_subfinder.result(), f_crtsh.result(), f_shodan.result()
+        )
+
+    result.subdomain_sources = {
+        "subfinder": subs_sf, "crt.sh": subs_crt, "shodan": subs_sh,
+    }
+    result.subdomains_merged = subdomains.merge_sources(
+        result.target, subs_sf, subs_crt, subs_sh
+    )
+    console.print(f"[green][+] {len(result.subdomains_merged)} subdominios únicos[/green]")
+
+    result.subdomains_alive = subdomains.check_alive(
+        client, result.subdomains_merged, protocol
+    )
+    console.print(f"[green][+] {len(result.subdomains_alive)} subdominios vivos[/green]")
+
+    if not result.subdomains_alive:
+        return
+
+    console.rule("Comparación de postura de seguridad")
+    if use_nuclei:
+        console.print(
+            "[dim]  (nuclei solo se ejecuta sobre el dominio raíz, no por subdominio, "
+            "para no disparar N procesos de nuclei en paralelo)[/dim]"
+        )
+    with console.status(f"[cyan]Evaluando {len(result.subdomains_alive)} subdominios en paralelo...[/cyan]"):
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {
+                pool.submit(evaluate_host, client, sub, None, True, False, deep, False): sub
+                for sub in result.subdomains_alive
+            }
+            for future in as_completed(futures):
+                host = future.result()
+                result.hosts[host.hostname] = host
+                console.print(f"[dim]  ✓ {host.hostname} (score {host.score})[/dim]")
+
+    sub_hosts = [result.hosts[h] for h in result.subdomains_alive]
+    render_posture_table(root_host, sub_hosts)
+
+    alerts = posture.weakest_links(root_host, sub_hosts)
+    for alert in alerts:
+        console.print(
+            f"[bold red][!] {alert['hostname']}: {alert['gap']} puntos por debajo "
+            f"del dominio raíz (score {alert['score']}) — revisar como prioridad[/bold red]"
+        )
+
+
+def render_posture_table(root_host: HostResult, sub_hosts: list[HostResult]) -> None:
+    rows = posture.build_comparison_table(root_host, sub_hosts)
+    table = Table(title="Postura de seguridad: dominio raíz vs subdominios")
+    for col in ("Host", "Score", "HSTS", "CSP", "XFO", "Cookies", "WAF", "Vulns"):
+        table.add_column(col)
+    for row in rows:
+        table.add_row(
+            row["host"], str(row["score"]), row["hsts"], row["csp"],
+            row["xfo"], row["cookies"], row["waf"], str(row["vulns"]),
+        )
+    console.print(table)
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nexrecon", description="Nexrecon — reconocimiento web automatizado"
+    )
+    parser.add_argument("target", help="Dominio o subdominio objetivo")
+    parser.add_argument("-o", "--output", default=config.DEFAULT_OUTPUT_DIR,
+                         help="Carpeta base de resultados")
+    parser.add_argument("-n", "--no-export", action="store_true",
+                         help="No exportar a disco, solo mostrar en pantalla")
+    parser.add_argument("-s", "--subdomain", action="store_true",
+                         help="Modo subdominio: omite WHOIS/DNS extra/descubrimiento")
+    parser.add_argument("-d", "--deep", action="store_true",
+                         help="Modo intensivo: wordlist grande (big.txt), wpscan en "
+                              "modo mixed, y activa nuclei automáticamente")
+    parser.add_argument("--nuclei", action="store_true",
+                         help="Ejecuta nuclei sobre el dominio raíz (ruidoso; no se "
+                              "activa por defecto). Implícito si se usa -d/--deep")
+    return parser
+
+
+def write_reports(result: ScanResult, output_dir: str) -> None:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_target = result.target.replace("/", "_")
+    outdir = Path(output_dir) / f"{safe_target}_{timestamp}"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    markdown_report.write_markdown(result, outdir / "reporte_final.md")
+    json_report.write_json(result, outdir / "reporte_final.json")
+
+    # Mismo patrón que la versión bash: ficheros sueltos además del
+    # reporte completo, para quien quiera un `cat`/`grep` rápido sin
+    # abrir el Markdown entero.
+    if result.subdomains_alive:
+        (outdir / "subdominios_vivos.txt").write_text(
+            "\n".join(result.subdomains_alive), encoding="utf-8"
+        )
+
+    root_host = result.hosts.get(result.target)
+    if root_host and root_host.wordpress and root_host.wordpress.get("raw"):
+        (outdir / "wordpress.txt").write_text(root_host.wordpress["raw"], encoding="utf-8")
+
+    console.print(f"\n[green][+] Reporte guardado en: {outdir}[/green]")
+
+def render_summary(result: ScanResult) -> None:
+    """Lo mínimo que quieres ver sin tener que abrir el reporte: IPs,
+    hallazgos HIGH/CRITICAL, subdominios vivos, y si hubo WordPress.
+    Se imprime siempre que haya algo que contar, incluso con -n.
+    """
+    console.rule("[bold]Resumen ejecutivo[/bold]")
+
+    if result.ip_addresses:
+        console.print(f"[bold]IPs:[/bold] {', '.join(result.ip_addresses)}")
+
+    root_host = result.hosts.get(result.target)
+    if root_host:
+        console.print(f"[bold]Score dominio raíz:[/bold] {root_host.score}/100")
+
+    if result.axfr_results:
+        console.print(
+            f"[bold red]AXFR filtrado contra {len(result.axfr_results)} nameserver(s)[/bold red]"
+        )
+
+    high = posture.high_severity_findings(result)
+    if high:
+        console.print(f"\n[bold]Hallazgos HIGH/CRITICAL ({len(high)}):[/bold]")
+        for hostname, finding in high:
+            console.print(
+                f"  [bold]{finding.severity.value.upper()}[/bold] "
+                f"{finding.title} [dim]({hostname})[/dim]"
+            )
+    else:
+        console.print("\n[green]Sin hallazgos HIGH/CRITICAL[/green]")
+
+    if result.subdomains_alive:
+        console.print(
+            f"\n[bold]Subdominios vivos ({len(result.subdomains_alive)}):[/bold] "
+            f"{', '.join(result.subdomains_alive)}"
+        )
+
+    for hostname, host in result.hosts.items():
+        if not host.wordpress:
+            continue
+        wp = host.wordpress
+        if wp.get("error") or wp.get("timed_out"):
+            status = wp.get("error") or f"timeout a los {config.WPSCAN_TIMEOUT_DEFAULT}s"
+            console.print(f"\n[yellow]WordPress ({hostname}): wpscan no completó — {status}[/yellow]")
+        elif wp.get("raw"):
+            console.print(
+                f"\n[bold]WordPress ({hostname}):[/bold] wpscan generó salida "
+                f"— ver wordpress.txt / reporte_final.md para detalle "
+                f"(usuarios/plugins no se parsean aún de forma estructurada)"
+            )
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    print_banner()
+
+    client = HttpClient()
+    result = ScanResult(target=args.target, mode="subdomain" if args.subdomain else "full")
+    exit_code = 0
+
+    try:
+        run_phase1(client, result, args.subdomain)
+        run_phase2(client, result, args.subdomain,
+                   deep=args.deep, use_nuclei=args.nuclei or args.deep)
+    except KeyboardInterrupt:
+        console.print("\n[bold red][!] Interrumpido por el usuario[/bold red]")
+        exit_code = 130
+    except Exception:
+        console.print_exception()
+        exit_code = 1
+    finally:
+        result.finish()
+        client.close()
+        render_summary(result)
+        if args.no_export:
+            console.print("\n[dim]Exportación desactivada (-n)[/dim]")
+        else:
+            try:
+                write_reports(result, args.output)
+            except OSError as exc:
+                console.print(f"[red][!] No se pudo escribir el reporte: {exc}[/red]")
+
+    if exit_code:
+        sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
