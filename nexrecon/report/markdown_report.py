@@ -186,11 +186,27 @@ def to_markdown(result: ScanResult) -> str:
                    f"IPs encontradas: {len(result.ip_addresses)}", "```",
                    "\n".join(result.ip_addresses), "```", ""]
         for intel in result.ip_intel:
-            parts.append(f"**{intel.ip}** (Shodan InternetDB)")
+            hosting_label = (
+                "Sí (hosting/datacenter)" if intel.is_hosting is True
+                else "No (posible IP directa/residencial/corporativa)" if intel.is_hosting is False
+                else "sin determinar"
+            )
+            parts.append(f"**{intel.ip}**")
+            parts.append(f"- Hosting/Datacenter: {hosting_label}")
+            if intel.cdn_provider:
+                parts.append(
+                    f"- ⚠️ CDN/Proxy detectado: **{intel.cdn_provider}** — "
+                    "la IP real del servidor de origen puede diferir de esta."
+                )
             if intel.shodan_ports:
-                parts.append(f"- Puertos: {', '.join(map(str, intel.shodan_ports))}")
+                parts.append(f"- Puertos (Shodan): {', '.join(map(str, intel.shodan_ports))}")
             if intel.shodan_cves:
-                parts.append(f"- CVEs conocidas: {', '.join(intel.shodan_cves)}")
+                parts.append(f"- CVEs conocidas (Shodan): {', '.join(intel.shodan_cves)}")
+            if intel.ipinfo_summary:
+                parts.append("")
+                parts.append("```")
+                parts.append(intel.ipinfo_summary)
+                parts.append("```")
             parts.append("")
 
     parts += ["---", "", "## Fase 2 — Reconocimiento activo", ""]

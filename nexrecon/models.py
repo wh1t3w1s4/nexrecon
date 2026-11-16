@@ -74,6 +74,8 @@ class DnsRecordSet:
 class IpIntel:
     ip: str
     ipinfo_summary: str = ""
+    is_hosting: Optional[bool] = None  # True/False si ipinfo lo determina, None si no se pudo parsear
+    cdn_provider: Optional[str] = None  # p.ej. "Cloudflare" — la IP real del origen puede diferir
     shodan_ports: list[int] = field(default_factory=list)
     shodan_hostnames: list[str] = field(default_factory=list)
     shodan_cves: list[str] = field(default_factory=list)

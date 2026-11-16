@@ -51,7 +51,11 @@ def check_technologies(host: HostResult) -> list[VulnMatch]:
                 host.add_finding(
                     f"{tech} {version_str} vulnerable (< {entry.fixed_in})",
                     Severity.HIGH,
-                    f"{entry.cve} — {entry.description}",
+                    f"{entry.cve} — {entry.description}. Nota: la versión se "
+                    "detecta por fingerprinting HTTP (whatweb); si hay un "
+                    "WAF/CDN delante del origen real, puede corresponder al "
+                    "proxy y no al servidor efectivo — confirma antes de dar "
+                    "esto por explotable.",
                     reference=entry.reference,
                     module="vuln_db",
                 )

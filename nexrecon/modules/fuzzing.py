@@ -1,14 +1,4 @@
 """Fuzzing de directorios con ffuf + filtrado de ruido.
-
-La parte interesante respecto al bash: la detección de "patrón repetido"
-(mismo status/words/lines apareciendo muchas veces = probable wildcard)
-se resuelve con collections.Counter en dos líneas, en vez del array
-asociativo simulado con claves "status|words|lines" en bash.
-
-`run_ffuf` es un único intento y `fuzz` decide la política (reintento
-limitado si el servidor rate-limita). ffuf corta por `-maxtime` y aun
-así escribe el JSON, de modo que un tope de tiempo no cuesta los
-resultados ya obtenidos — solo los marca como parciales.
 """
 from __future__ import annotations
 

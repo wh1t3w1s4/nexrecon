@@ -1,6 +1,6 @@
 """Configuración centralizada: rutas, umbrales, listas de User-Agents y
 la base de datos de vulnerabilidades por versión (equivalente a VULN_DB
-en el bash, pero como objetos tipados en vez de strings separados por '|').
+en web-recon).
 """
 from __future__ import annotations
 
@@ -105,7 +105,39 @@ VULN_DB: list[VulnEntry] = [
     VulnEntry("PHP", "5.6.40", "", "CVE-2019-11043",
               "RCE en php-fpm bajo nginx con rutas concretas",
               "https://nvd.nist.gov/vuln/detail/CVE-2019-11043"),
+    VulnEntry("Drupal", "7.58", "", "CVE-2018-7600",
+              "Drupalgeddon2 — RCE no autenticado vía renderizado de formularios",
+              "https://nvd.nist.gov/vuln/detail/CVE-2018-7600"),
+    VulnEntry("Joomla", "3.4.6", "", "CVE-2015-8562",
+              "RCE vía deserialización de objetos en el User-Agent/X-Forwarded-For",
+              "https://nvd.nist.gov/vuln/detail/CVE-2015-8562"),
+    VulnEntry("Joomla", "3.9.4", "", "CVE-2019-10945",
+              "Path traversal autenticado en el gestor de medios",
+              "https://nvd.nist.gov/vuln/detail/CVE-2019-10945"),
+    VulnEntry("Tomcat", "9.0.31", "9.", "CVE-2020-1938",
+              "Ghostcat — lectura de ficheros / RCE vía conector AJP (rama 9.x)",
+              "https://nvd.nist.gov/vuln/detail/CVE-2020-1938"),
+    VulnEntry("Tomcat", "8.5.51", "8.", "CVE-2020-1938",
+              "Ghostcat — lectura de ficheros / RCE vía conector AJP (rama 8.x)",
+              "https://nvd.nist.gov/vuln/detail/CVE-2020-1938"),
+    VulnEntry("Tomcat", "7.0.100", "7.", "CVE-2020-1938",
+              "Ghostcat — lectura de ficheros / RCE vía conector AJP (rama 7.x)",
+              "https://nvd.nist.gov/vuln/detail/CVE-2020-1938"),
+    VulnEntry("OpenSSH", "7.7", "", "CVE-2018-15473",
+              "Enumeración de usuarios válidos vía timing en la autenticación",
+              "https://nvd.nist.gov/vuln/detail/CVE-2018-15473"),
+    VulnEntry("phpMyAdmin", "4.8.2", "", "CVE-2018-12613",
+              "LFI vía parámetro target, permite incluir ficheros arbitrarios",
+              "https://nvd.nist.gov/vuln/detail/CVE-2018-12613"),
 ]
+
+# Limitación conocida del modelo: VULN_DB solo soporta "vulnerable si la
+# versión detectada es menor que una versión con fix" — no cubre casos
+# de versión exacta comprometida sin relación con un "fix" posterior,
+# como el backdoor de vsftpd 2.3.4 (una build concreta troyanizada, no
+# un bug corregido en una versión posterior). Esos casos requerirían un
+# tipo de entrada distinto (match exacto en vez de "menor que"); no están
+# cubiertos todavía.
 
 
 # Anotaciones de registros DNS (equivalente a interpretar_registro en bash)

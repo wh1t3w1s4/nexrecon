@@ -97,11 +97,19 @@ def run_phase1(client: HttpClient, result: ScanResult, subdomain_mode: bool) -> 
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {
-            pool.submit(ip_intel.query_internetdb, client, ip): ip
+            pool.submit(ip_intel.gather_ip_intel, client, ip): ip
             for ip in result.ip_addresses
         }
         for future in as_completed(futures):
-            result.ip_intel.append(future.result())
+            intel = future.result()
+            result.ip_intel.append(intel)
+            hosting_label = (
+                "hosting/datacenter" if intel.is_hosting is True
+                else "no-hosting (posible IP directa/residencial)" if intel.is_hosting is False
+                else "sin determinar"
+            )
+            cdn_note = f" — CDN: {intel.cdn_provider}" if intel.cdn_provider else ""
+            console.print(f"[dim]  {intel.ip}: {hosting_label}{cdn_note}[/dim]")
 
 
 def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None,
@@ -178,6 +186,29 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
             if verbose:
                 console.print("[yellow][-] wpscan no encontrado, se omite[/yellow]")
         else:
+            if deep and not config.WPSCAN_API_TOKEN:
+                console.print(
+                    "[bold yellow][!] --deep sin WPSCAN_API_TOKEN: wpscan no podrá "
+                    "cruzar contra la base de datos de CVEs de WPScan, solo detectará "
+                    "plugins/temas/usuarios sin marcar cuáles son vulnerables.[/bold yellow]"
+                )
+                console.print(
+                    "[dim]    Consigue uno gratis en https://wpscan.com/ y expórtalo: "
+                    "export WPSCAN_API_TOKEN=\"...\"[/dim]"
+                )
+                host.add_finding(
+                    "wpscan sin API token en modo --deep", Severity.INFO,
+                    "Sin WPSCAN_API_TOKEN no se identifican vulnerabilidades conocidas "
+                    "de los plugins/temas detectados, solo su presencia.",
+                    module="wordpress",
+                )
+
+            if verbose:
+                console.print("[green][+] Actualizando base de datos de wpscan...[/green]")
+            update_result = step("wpscan --update", waf_wordpress.update_wpscan_db)
+            if verbose and not update_result["ok"]:
+                console.print(f"[dim]  wpscan --update: {update_result['output'][:120]}[/dim]")
+
             wp_mode = config.WPSCAN_MODE_DEEP if deep else config.WPSCAN_MODE_DEFAULT
             wp_timeout = config.WPSCAN_TIMEOUT_DEEP if deep else config.WPSCAN_TIMEOUT_DEFAULT
             if verbose:
@@ -185,9 +216,20 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
                     f"[green][+] WordPress detectado, lanzando wpscan en modo "
                     f"'{wp_mode}' (timeout {wp_timeout}s)[/green]"
                 )
-            host.wordpress = step(
-                "wpscan en curso", waf_wordpress.run_wpscan, base_url, wp_timeout, wp_mode
+
+            def _on_wpscan_line(line: str, _verbose=verbose) -> None:
+                # wpscan usa \r para las barras de progreso en la misma
+                # línea; nos quedamos solo con el último fragmento, que
+                # es lo que un terminal real mostraría.
+                display = line.split("\r")[-1].strip()
+                if _verbose and display.startswith(("[+]", "[i]", "[!]")):
+                    console.print(f"  [dim cyan]{display}[/dim cyan]")
+
+            host.wordpress = waf_wordpress.run_wpscan(
+                base_url, wp_timeout, wp_mode,
+                on_line=_on_wpscan_line if verbose else None,
             )
+
             # Superficie explícita del resultado: antes un timeout o un fallo
             # de wpscan quedaba indistinguible de "corrió bien y no encontró
             # nada", y en el reporte salía un bloque vacío sin explicación.
@@ -206,12 +248,38 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
                 )
                 if verbose:
                     console.print(f"[yellow][-] wpscan: {host.wordpress['error']}[/yellow]")
-            elif verbose:
+            else:
                 raw = host.wordpress.get("raw", "")
-                if raw:
-                    console.print(f"[green][+] wpscan: {len(raw.splitlines())} líneas de salida (ver reporte)[/green]")
-                else:
-                    console.print("[dim]  wpscan: sin hallazgos relevantes en modo passive[/dim]")
+                if verbose:
+                    if raw:
+                        console.print(f"[green][+] wpscan: {len(raw.splitlines())} líneas de salida (ver reporte)[/green]")
+                    else:
+                        console.print("[dim]  wpscan: sin hallazgos relevantes en modo passive[/dim]")
+
+                # Clasificación de usuarios/backups en hallazgos reales,
+                # no solo texto suelto dentro del bloque de wpscan.
+                wp_findings = waf_wordpress.extract_wordpress_findings(host.wordpress.get("lines", []))
+                severity_map = {"medium": Severity.MEDIUM, "low": Severity.LOW, "critical": Severity.CRITICAL}
+                for wf in wp_findings:
+                    host.add_finding(
+                        wf["title"], severity_map.get(wf["severity"], Severity.INFO),
+                        wf["detail"], module="wordpress",
+                    )
+                if verbose and wp_findings:
+                    users = sum(1 for f in wp_findings if f["kind"] == "user")
+                    backups = sum(1 for f in wp_findings if f["kind"] == "config_backup")
+                    if users:
+                        console.print(f"[yellow][!] {users} usuario(s) de WordPress identificado(s)[/yellow]")
+                    if backups:
+                        console.print(f"[bold red][!] {backups} posible(s) backup(s) de configuración expuesto(s)[/bold red]")
+
+            if host.wordpress.get("db_outdated"):
+                host.add_finding(
+                    "Base de datos de wpscan desactualizada", Severity.INFO,
+                    "Actualízala con: wpscan --update", module="wordpress",
+                )
+                if verbose:
+                    console.print("[yellow][!] wpscan avisa de BD desactualizada — ejecuta: wpscan --update[/yellow]")
 
     if use_nuclei:
         if not nuclei_scan.nuclei_available():
@@ -280,15 +348,27 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
             )
 
         if forbidden:
-            if verbose:
-                console.print(f"[yellow][!] Probando bypass sobre {len(forbidden)} rutas con 403[/yellow]")
-            bypass_hits = []
-            for url in forbidden:
-                path = url.replace(base_url, "", 1)
-                bypass_hits += bypass403.test_bypass(client, base_url, path)
-            host.forbidden_bypassed = bypass_hits
-            if verbose and bypass_hits:
-                console.print(f"[red][!] {len(bypass_hits)} bypass(es) conseguidos[/red]")
+            if deep:
+                if verbose:
+                    console.print(f"[yellow][!] Probando bypass sobre {len(forbidden)} rutas con 403[/yellow]")
+                bypass_hits = []
+                for url in forbidden:
+                    path = url.replace(base_url, "", 1)
+                    bypass_hits += bypass403.test_bypass(client, base_url, path)
+                host.forbidden_bypassed = bypass_hits
+                if verbose and bypass_hits:
+                    console.print(f"[red][!] {len(bypass_hits)} bypass(es) conseguidos[/red]")
+            else:
+                host.add_finding(
+                    f"{len(forbidden)} ruta(s) con 403 detectadas", Severity.INFO,
+                    "Ejecuta con -d/--deep para intentar técnicas de bypass automáticamente.",
+                    module="fuzzing",
+                )
+                if verbose:
+                    console.print(
+                        f"[dim]  {len(forbidden)} rutas con 403 — usa -d/--deep "
+                        f"para intentar bypass automático[/dim]"
+                    )
 
     posture.compute_score(host)
     if verbose:
@@ -443,6 +523,14 @@ def render_summary(result: ScanResult) -> None:
 
     if result.ip_addresses:
         console.print(f"[bold]IPs:[/bold] {', '.join(result.ip_addresses)}")
+        for intel in result.ip_intel:
+            hosting_label = (
+                "hosting/datacenter" if intel.is_hosting is True
+                else "no-hosting" if intel.is_hosting is False
+                else "sin determinar"
+            )
+            cdn_note = f" [bold yellow](CDN: {intel.cdn_provider})[/bold yellow]" if intel.cdn_provider else ""
+            console.print(f"  [dim]{intel.ip}: {hosting_label}[/dim]{cdn_note}")
 
     root_host = result.hosts.get(result.target)
     if root_host:
