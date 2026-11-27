@@ -7,24 +7,33 @@ de evaluar substrings del Set-Cookie crudo cada vez.
 from __future__ import annotations
 
 from ..http_client import HttpClient
-from ..models import Cookie, Finding, HostResult, Severity
+from ..models import Cookie, HostResult, Severity
 
 
 def _parse_cookie(raw: str) -> Cookie:
-    name = raw.split("=", 1)[0].strip()
-    lowered = raw.lower()
-    same_site = None
-    if "samesite=lax" in lowered:
-        same_site = "Lax"
-    elif "samesite=strict" in lowered:
-        same_site = "Strict"
-    elif "samesite=none" in lowered:
-        same_site = "None"
+    """Parsea los atributos del Set-Cookie, no el texto crudo.
+
+    Buscar "secure" como substring de toda la línea daba falsos
+    positivos: una cookie llamada `secure_token=abc` (o con "secure" en
+    su valor) contaba como si tuviera el flag Secure. El primer segmento
+    antes del primer `;` es siempre `nombre=valor`; solo los siguientes
+    son atributos.
+    """
+    segments = [seg.strip() for seg in raw.split(";")]
+    name = segments[0].split("=", 1)[0].strip()
+    attrs: dict[str, str] = {}
+    for seg in segments[1:]:
+        key, _, value = seg.partition("=")
+        attrs[key.strip().lower()] = value.strip()
+
+    same_site = {"lax": "Lax", "strict": "Strict", "none": "None"}.get(
+        attrs.get("samesite", "").lower()
+    )
     return Cookie(
         name=name,
         raw=raw,
-        http_only="httponly" in lowered,
-        secure="secure" in lowered,
+        http_only="httponly" in attrs,
+        secure="secure" in attrs,
         same_site=same_site,
     )
 
@@ -91,14 +100,13 @@ def analyze(client: HttpClient, host: HostResult, base_url: str) -> None:
 
     acao = headers.get("access-control-allow-origin", "")
     acac = headers.get("access-control-allow-credentials", "").lower()
-    if acao:
-        if "*" in acao and acac == "true":
-            host.add_finding(
-                "CORS mal configurado", Severity.CRITICAL,
-                "Access-Control-Allow-Origin: * junto con Allow-Credentials: true "
-                "permite a cualquier origen leer respuestas autenticadas.",
-                module="headers",
-            )
+    if acao and "*" in acao and acac == "true":
+        host.add_finding(
+            "CORS mal configurado", Severity.CRITICAL,
+            "Access-Control-Allow-Origin: * junto con Allow-Credentials: true "
+            "permite a cualquier origen leer respuestas autenticadas.",
+            module="headers",
+        )
 
     for hdr, label in (("x-powered-by", "X-Powered-By"), ("server", "Server")):
         if hdr in headers:
@@ -109,7 +117,7 @@ def analyze(client: HttpClient, host: HostResult, base_url: str) -> None:
 
     # --- Cookies ---
     for raw in set_cookie:
-        cookie = _parse_cookie(raw)
+        cookie = _parse_cookie(client.auth.redact_set_cookie(raw) if client.auth else raw)
         host.cookies.append(cookie)
 
         if cookie.has_no_protection:

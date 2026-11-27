@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
+from ..auth import redact_text
 from ..models import SEVERITY_RANK, HostResult, ScanResult, Severity
 from ..modules import posture
 
@@ -48,7 +49,7 @@ def _host_section(host: HostResult) -> str:
         lines.append(
             "_Nota: \"Vulnerabilidades por versión\" (arriba) es exclusivamente "
             "VULN_DB; esta lista mezcla el resto de módulos (cabeceras, cookies, "
-            "WAF, DNS/AXFR, fuzzing y nuclei si se usó --nuclei/--deep), "
+            "WAF, DNS/AXFR, fuzzing, descubrimiento de endpoints, sondas activas, searchsploit y nuclei si se usó --nuclei/--deep), "
             "identificados entre corchetes._\n"
         )
         for finding in sorted(host.findings,
@@ -76,6 +77,17 @@ def _host_section(host: HostResult) -> str:
         lines.append("```")
         for hit in host.directories_clean:
             lines.append(f"[{hit.status}] {hit.url}")
+        lines.append("```\n")
+
+    if host.endpoints:
+        shown = host.endpoints[:100]
+        lines.append(f"**Endpoints descubiertos ({len(host.endpoints)}):**")
+        lines.append("```")
+        for ep in shown:
+            params = f"  params: {', '.join(ep.params)}" if ep.params else ""
+            lines.append(f"[{ep.source}] {ep.method} {ep.url}{params}")
+        if len(host.endpoints) > len(shown):
+            lines.append(f"... ({len(host.endpoints) - len(shown)} más en el JSON)")
         lines.append("```\n")
 
     if host.forbidden_bypassed:
@@ -137,6 +149,20 @@ def to_markdown(result: ScanResult) -> str:
         f"**Fecha de inicio:** {result.started_at}",
         f"**Fecha de fin:** {result.finished_at or 'en curso'}",
         f"**Modo:** {result.mode}",
+    ]
+    if result.active_probes_used:
+        parts.append(
+            "**Sondas activas (--active-probes):** sí — los hallazgos del módulo "
+            "`active_probes` son señales de DETECCIÓN, nunca explotación confirmada; "
+            "revisa manualmente cada uno antes de considerarlo un hallazgo real."
+        )
+    if result.authenticated:
+        parts.append(
+            "**Escaneo autenticado:** sí — cookies usadas: "
+            + ", ".join(f"`{n}`" for n in result.cookie_names)
+            + " (valores no incluidos en el reporte)"
+        )
+    parts += [
         "",
         "---",
         "",
@@ -234,5 +260,5 @@ def to_markdown(result: ScanResult) -> str:
     return "\n".join(parts)
 
 
-def write_markdown(result: ScanResult, path: Path) -> None:
-    path.write_text(to_markdown(result), encoding="utf-8")
+def write_markdown(result: ScanResult, path: Path, secrets: list[str] | None = None) -> None:
+    path.write_text(redact_text(to_markdown(result), secrets or []), encoding="utf-8")

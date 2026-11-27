@@ -28,7 +28,7 @@ def strip_ansi(text: str) -> str:
 def run_whois(domain: str, lines: int = 20) -> str:
     try:
         proc = subprocess.run(
-            ["whois", domain], capture_output=True, text=True, timeout=15
+            ["whois", domain], capture_output=True, text=True, timeout=15, check=False
         )
         return "\n".join(proc.stdout.splitlines()[:lines])
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
@@ -45,7 +45,7 @@ def run_ipinfo(ip: str) -> str:
     """
     try:
         proc = subprocess.run(
-            ["ipinfo", ip], capture_output=True, text=True, timeout=10
+            ["ipinfo", ip], capture_output=True, text=True, timeout=10, check=False
         )
         return strip_ansi(proc.stdout.strip())
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:

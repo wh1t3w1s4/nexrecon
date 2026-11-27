@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from .. import config
 from ..models import SEVERITY_RANK, Finding, HostResult, ScanResult, Severity
+from .searchsploit_scan import count_exploits
 
 _SEVERITY_PENALTY = {
     Severity.CRITICAL: -25,
@@ -127,6 +128,7 @@ def build_comparison_table(root_host: HostResult,
     """
     rows = []
     for host in [root_host, *sub_hosts]:
+        confirmed, total = count_exploits(host)
         rows.append({
             "host": host.hostname,
             "score": host.score,
@@ -139,6 +141,7 @@ def build_comparison_table(root_host: HostResult,
             "cookies": cookie_summary(host),
             "waf": "SI" if host.waf else "NO",
             "vulns": len(host.vulns),
+            "exploits": f"{confirmed}/{total}",
         })
     return rows
 

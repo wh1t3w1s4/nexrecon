@@ -13,11 +13,14 @@ PLUGIN_RE = re.compile(r"^\[ (.+) \]$")
 VERSION_RE = re.compile(r"Version\s*:\s*([^\s(]+)")
 
 
-def run_whatweb(url: str) -> str:
+def run_whatweb(url: str, cookie_header: str | None = None) -> str:
+    cmd = ["whatweb", "-v", "--color=never"]
+    if cookie_header:
+        cmd += ["--header", f"Cookie: {cookie_header}"]
     try:
         proc = subprocess.run(
-            ["whatweb", "-v", "--color=never", url],
-            capture_output=True, text=True, timeout=30,
+            [*cmd, url],
+            capture_output=True, text=True, timeout=30, check=False,
         )
         return proc.stdout
     except (subprocess.TimeoutExpired, FileNotFoundError):

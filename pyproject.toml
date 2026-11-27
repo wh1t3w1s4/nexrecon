@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexrecon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Herramienta de reconocimiento web (recon automatizado, análisis de postura de seguridad)"
 authors = [{ name = "w1s4" }]
 requires-python = ">=3.10"
@@ -22,3 +22,19 @@ nexrecon = "nexrecon.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["nexrecon*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "PLW", "BLE", "PYI"]
+ignore = [
+    # Los wrappers de herramientas externas capturan Exception a propósito:
+    # un fallo de un módulo no debe tumbar el escaneo completo.
+    "BLE001",
+    # try/except/continue intencionado en parsers tolerantes (JSONL de nuclei, versiones).
+    "S112",
+    # __enter__ devuelve el nombre de la clase; no se usa typing.Self para mantener py3.10.
+    "PYI034",
+]

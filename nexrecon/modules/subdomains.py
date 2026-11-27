@@ -23,7 +23,7 @@ def run_subfinder(domain: str, timeout: int = 120) -> list[str]:
     try:
         proc = subprocess.run(
             ["subfinder", "-silent", "-d", domain],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, check=False,
         )
         return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
     except (subprocess.TimeoutExpired, FileNotFoundError):

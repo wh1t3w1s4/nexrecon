@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
 
 
 class Severity(str, Enum):
@@ -52,7 +51,7 @@ class Cookie:
     raw: str
     http_only: bool = False
     secure: bool = False
-    same_site: Optional[str] = None
+    same_site: str | None = None
 
     @property
     def is_fully_protected(self) -> bool:
@@ -74,8 +73,8 @@ class DnsRecordSet:
 class IpIntel:
     ip: str
     ipinfo_summary: str = ""
-    is_hosting: Optional[bool] = None  # True/False si ipinfo lo determina, None si no se pudo parsear
-    cdn_provider: Optional[str] = None  # p.ej. "Cloudflare" — la IP real del origen puede diferir
+    is_hosting: bool | None = None  # True/False si ipinfo lo determina, None si no se pudo parsear
+    cdn_provider: str | None = None  # p.ej. "Cloudflare" — la IP real del origen puede diferir
     shodan_ports: list[int] = field(default_factory=list)
     shodan_hostnames: list[str] = field(default_factory=list)
     shodan_cves: list[str] = field(default_factory=list)
@@ -102,24 +101,47 @@ class DirectoryHit:
 
 
 @dataclass
+class Endpoint:
+    """Punto de entrada HTTP descubierto. Lista única que alimenta tanto el
+    reporte como `--active-probes`, venga de donde venga (formulario HTML,
+    enlace con query, ruta de fuzzing, bundle JS o `--param` manual).
+
+    `params` es nombre -> valor por defecto. Los campos hidden/password
+    (tokens CSRF, etc.) se guardan SIN valor y se listan en `hidden`: el
+    reporte no debe filtrar tokens, y un token viejo no sirve para probar.
+    """
+    url: str  # sin query ni fragmento
+    method: str = "GET"
+    params: dict[str, str] = field(default_factory=dict)
+    source: str = ""  # form | link | fuzz | js | manual
+    found_in: str = ""  # página o bundle donde apareció
+    hidden: list[str] = field(default_factory=list)
+
+    @property
+    def key(self) -> tuple:
+        return (self.method, self.url, tuple(sorted(self.params)))
+
+
+@dataclass
 class HostResult:
     """Todo lo que sabemos de un host concreto (el raíz o un
     subdominio). Es la unidad que luego se compara en la fase de
     postura de seguridad, y la unidad que se serializa a JSON/Markdown.
     """
     hostname: str
-    protocol: Optional[str] = None
+    protocol: str | None = None
     technologies: dict[str, str] = field(default_factory=dict)  # nombre -> version
     headers: dict[str, str] = field(default_factory=dict)
     cookies: list[Cookie] = field(default_factory=list)
-    waf: Optional[str] = None
+    waf: str | None = None
     findings: list[Finding] = field(default_factory=list)
     vulns: list[VulnMatch] = field(default_factory=list)
     score_breakdown: list[tuple[str, int]] = field(default_factory=list)
     directories_clean: list[DirectoryHit] = field(default_factory=list)
     directories_suspicious: list[DirectoryHit] = field(default_factory=list)
     forbidden_bypassed: list[dict] = field(default_factory=list)
-    wordpress: Optional[dict] = None
+    wordpress: dict | None = None
+    endpoints: list[Endpoint] = field(default_factory=list)
     score: int = 60
 
     def add_finding(self, title: str, severity: Severity, detail: str = "",
@@ -139,7 +161,7 @@ class ScanResult:
     target: str
     mode: str  # "full" o "subdomain"
     started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    finished_at: Optional[str] = None
+    finished_at: str | None = None
     whois_raw: str = ""
     dns_records: dict[str, DnsRecordSet] = field(default_factory=dict)
     ip_addresses: list[str] = field(default_factory=list)
@@ -151,6 +173,10 @@ class ScanResult:
     robots_paths: list[str] = field(default_factory=list)
     axfr_attempted: bool = False
     axfr_results: dict[str, list[str]] = field(default_factory=dict)
+    # Recon autenticado (--cookie): SOLO nombres, nunca valores.
+    authenticated: bool = False
+    cookie_names: list[str] = field(default_factory=list)
+    active_probes_used: bool = False
 
     def get_or_create_host(self, hostname: str) -> HostResult:
         if hostname not in self.hosts:

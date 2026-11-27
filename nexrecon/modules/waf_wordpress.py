@@ -9,7 +9,7 @@ import re
 import shutil
 import subprocess
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from .. import config
 
@@ -26,7 +26,7 @@ def detect_waf(url: str) -> str | None:
     """
     try:
         proc = subprocess.run(
-            ["wafw00f", url], capture_output=True, text=True, timeout=30
+            ["wafw00f", url], capture_output=True, text=True, timeout=30, check=False
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
@@ -55,7 +55,9 @@ def update_wpscan_db(timeout: int = 60) -> dict:
     if config.WPSCAN_API_TOKEN:
         args += ["--api-token", config.WPSCAN_API_TOKEN]
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout, check=False,
+        )
         return {"ok": proc.returncode == 0, "output": proc.stdout.strip()}
     except subprocess.TimeoutExpired:
         return {"ok": False, "output": f"timeout a los {timeout}s"}
@@ -65,7 +67,8 @@ def update_wpscan_db(timeout: int = 60) -> dict:
 
 def run_wpscan(url: str, timeout: int = config.WPSCAN_TIMEOUT_DEFAULT,
                mode: str = config.WPSCAN_MODE_DEFAULT,
-               on_line: Callable[[str], None] | None = None) -> dict:
+               on_line: Callable[[str], None] | None = None,
+               cookie_header: str | None = None) -> dict:
     """`mode="passive"` (por defecto) detecta solo por rastro en el HTML,
     segundos. `mode="mixed"` añade barrido activo de slugs conocidos —
     minutos, y solo tiene sentido bajo --deep, con timeout más holgado.
@@ -94,6 +97,8 @@ def run_wpscan(url: str, timeout: int = config.WPSCAN_TIMEOUT_DEFAULT,
     ]
     if config.WPSCAN_API_TOKEN:
         args += ["--api-token", config.WPSCAN_API_TOKEN]
+    if cookie_header:
+        args += ["--cookie-string", cookie_header]
 
     try:
         proc = subprocess.Popen(

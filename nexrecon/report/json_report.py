@@ -8,6 +8,7 @@ import dataclasses
 import json
 from pathlib import Path
 
+from ..auth import redact_text
 from ..models import ScanResult
 
 
@@ -23,5 +24,5 @@ def to_json(result: ScanResult) -> str:
     return json.dumps(dataclasses.asdict(result), default=_default, indent=2, ensure_ascii=False)
 
 
-def write_json(result: ScanResult, path: Path) -> None:
-    path.write_text(to_json(result), encoding="utf-8")
+def write_json(result: ScanResult, path: Path, secrets: list[str] | None = None) -> None:
+    path.write_text(redact_text(to_json(result), secrets or []), encoding="utf-8")

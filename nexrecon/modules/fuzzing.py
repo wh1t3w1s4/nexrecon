@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import config
+from ..http_client import HttpClient
 from ..models import DirectoryHit
 
 
@@ -23,12 +24,17 @@ class FuzzRun:
 
 def run_ffuf(base_url: str, threads: int = config.FFUF_THREADS_DEFAULT,
              wordlist: str = config.WORDLIST_DEFAULT,
-             max_seconds: int = config.FFUF_MAX_SECONDS) -> FuzzRun:
+             max_seconds: int = config.FFUF_MAX_SECONDS,
+             cookie_header: str | None = None) -> FuzzRun:
     if not Path(wordlist).is_file():
         raise FileNotFoundError(f"Wordlist no encontrada: {wordlist}")
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         tmp_path = Path(tmp.name)
+
+    # ffuf es un binario externo: no comparte la sesión de Python, la cookie
+    # hay que pasársela como cabecera.
+    extra_headers = ["-H", f"Cookie: {cookie_header}"] if cookie_header else []
 
     truncated = False
     data: dict = {}
@@ -40,12 +46,14 @@ def run_ffuf(base_url: str, threads: int = config.FFUF_THREADS_DEFAULT,
                     "-w", wordlist, "-t", str(threads),
                     "-maxtime", str(max_seconds),
                     "-u", f"{base_url}/FUZZ",
+                    "-H", f"User-Agent: {HttpClient.random_ua()}",
+                    *extra_headers,
                     "-o", str(tmp_path), "-of", "json",
                 ],
-                capture_output=True, timeout=max_seconds + 30,
+                capture_output=True, timeout=max_seconds + 30, check=False,
             )
-        except FileNotFoundError:
-            raise FileNotFoundError("ffuf no está en el PATH")
+        except FileNotFoundError as exc:
+            raise FileNotFoundError("ffuf no está en el PATH") from exc
         except subprocess.TimeoutExpired:
             truncated = True
 
@@ -67,7 +75,8 @@ def count_rate_limit_hits(results: list[dict]) -> int:
 
 
 def fuzz(base_url: str, wordlist: str = config.WORDLIST_DEFAULT,
-         max_seconds: int = config.FFUF_MAX_SECONDS) -> FuzzRun:
+         max_seconds: int = config.FFUF_MAX_SECONDS,
+         cookie_header: str | None = None) -> FuzzRun:
     """Punto de entrada: un barrido y, si el servidor limita, uno más
     con menos hilos. No reintenta si ya se agotó el tiempo ni si no
     hubo ninguna señal de rate-limit.
@@ -84,7 +93,8 @@ def fuzz(base_url: str, wordlist: str = config.WORDLIST_DEFAULT,
     en que el reintento lo arregle por sí solo.
     """
     run = run_ffuf(base_url, threads=config.FFUF_THREADS_DEFAULT,
-                    wordlist=wordlist, max_seconds=max_seconds)
+                    wordlist=wordlist, max_seconds=max_seconds,
+                    cookie_header=cookie_header)
     rate_limit_hits = count_rate_limit_hits(run.results)
     run.rate_limit_hits_first_pass = rate_limit_hits
 
@@ -94,7 +104,8 @@ def fuzz(base_url: str, wordlist: str = config.WORDLIST_DEFAULT,
         return run
 
     throttled = run_ffuf(base_url, threads=config.FFUF_THREADS_THROTTLED,
-                          wordlist=wordlist, max_seconds=max_seconds)
+                          wordlist=wordlist, max_seconds=max_seconds,
+                          cookie_header=cookie_header)
     return FuzzRun(
         results=throttled.results, truncated=throttled.truncated,
         retried_with_fewer_threads=True, rate_limit_hits_first_pass=rate_limit_hits,

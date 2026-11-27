@@ -21,11 +21,24 @@ from rich.console import Console
 from rich.table import Table
 
 from . import config
+from .auth import argparse_cookie
 from .http_client import HttpClient
-from .models import HostResult, ScanResult, Severity
+from .models import Endpoint, HostResult, ScanResult, Severity
 from .modules import (
-    bypass403, dns_recon, fingerprint, fuzzing, headers_cookies,
-    ip_intel, nuclei_scan, posture, subdomains, vuln_db, waf_wordpress,
+    active_probes,
+    bypass403,
+    dns_recon,
+    endpoint_discovery,
+    fingerprint,
+    fuzzing,
+    headers_cookies,
+    ip_intel,
+    nuclei_scan,
+    posture,
+    searchsploit_scan,
+    subdomains,
+    vuln_db,
+    waf_wordpress,
 )
 from .report import json_report, markdown_report
 
@@ -33,7 +46,7 @@ console = Console()
 
 
 def print_banner() -> None:
-    console.print("[bold cyan]Nexrecon[/bold cyan] [yellow]v0.1.0[/yellow] — by w1s4")
+    console.print("[bold cyan]Nexrecon[/bold cyan] [yellow]v0.2.0[/yellow] — by w1s4")
     console.print("[dim]Reconocimiento web para auditorías autorizadas[/dim]\n")
 
 
@@ -114,7 +127,8 @@ def run_phase1(client: HttpClient, result: ScanResult, subdomain_mode: bool) -> 
 
 def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None,
                   run_fuzzing: bool = True, verbose: bool = True,
-                  deep: bool = False, use_nuclei: bool = False) -> HostResult:
+                  deep: bool = False, use_nuclei: bool = False,
+                  active_probes_on: bool = False, manual_param: Endpoint | None = None) -> HostResult:
     """Ejecuta todos los módulos de Fase 2 contra un host.
 
     `protocol=None` hace que se detecte por host: un subdominio puede
@@ -153,7 +167,9 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
                 return fn(*args)
         return fn(*args)
 
-    ww_output = step("Fingerprinting (whatweb)", fingerprint.run_whatweb, base_url)
+    cookie_header = client.auth.header if client.auth else None
+
+    ww_output = step("Fingerprinting (whatweb)", fingerprint.run_whatweb, base_url, cookie_header)
     if fingerprint.is_cloudflare_block(ww_output):
         host.add_finding("Cloudflare challenge detectado", Severity.INFO,
                           "whatweb omitido para este host.", module="whatweb")
@@ -174,6 +190,25 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
             console.print(f"[red][!] {len(host.vulns)} vulnerabilidad(es) conocidas por versión[/red]")
         else:
             console.print("[green][+] Sin vulnerabilidades conocidas por versión[/green]")
+
+    # searchsploit consulta una base offline (sin tráfico hacia el target),
+    # por eso corre siempre y no va gateado tras --deep.
+    exploit_findings = step(
+        "Buscando exploits públicos (searchsploit)",
+        searchsploit_scan.gather_exploits_for_host, host,
+    )
+    host.findings.extend(exploit_findings)
+    if verbose:
+        confirmed, total = searchsploit_scan.count_exploits(host)
+        if total:
+            console.print(
+                f"[red][!] searchsploit: {total} exploit(s) público(s) "
+                f"({confirmed} confirmado(s) por CVE)[/red]"
+            )
+        elif not searchsploit_scan.searchsploit_available():
+            console.print("[yellow][-] searchsploit no encontrado, se omite[/yellow]")
+        else:
+            console.print("[green][+] searchsploit: sin exploits públicos[/green]")
 
     host.waf = step("Detectando WAF", waf_wordpress.detect_waf, base_url)
     if verbose:
@@ -228,6 +263,7 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
             host.wordpress = waf_wordpress.run_wpscan(
                 base_url, wp_timeout, wp_mode,
                 on_line=_on_wpscan_line if verbose else None,
+                cookie_header=cookie_header,
             )
 
             # Superficie explícita del resultado: antes un timeout o un fallo
@@ -291,7 +327,8 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
         else:
             if verbose:
                 console.print("[green][+] Ejecutando nuclei (puede tardar varios minutos)[/green]")
-            raw_nuclei = step("nuclei en curso", nuclei_scan.run_nuclei, base_url)
+            raw_nuclei = step("nuclei en curso", nuclei_scan.run_nuclei, base_url,
+                               config.NUCLEI_MAX_SECONDS, cookie_header)
             nuclei_findings = nuclei_scan.findings_from_nuclei(raw_nuclei)
             host.findings.extend(nuclei_findings)
             if verbose:
@@ -309,7 +346,8 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
                 f"{Path(wordlist).name} a {config.FFUF_THREADS_DEFAULT} hilos (puede tardar)[/green]"
             )
         try:
-            run = step("Fuzzing con ffuf", fuzzing.fuzz, base_url, wordlist, max_seconds)
+            run = step("Fuzzing con ffuf", fuzzing.fuzz, base_url, wordlist, max_seconds,
+                       cookie_header)
         except FileNotFoundError as exc:
             run = fuzzing.FuzzRun(results=[])
             host.add_finding("Fuzzing omitido", Severity.INFO, str(exc), module="fuzzing")
@@ -370,6 +408,41 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
                         f"para intentar bypass automático[/dim]"
                     )
 
+    # Solo lectura (tope de ~35 GET): formularios, enlaces con query y JS propio.
+    disc_findings = step(
+        "Descubriendo endpoints (formularios, enlaces, JS propio)",
+        endpoint_discovery.discover, client, host, base_url,
+    )
+    host.findings.extend(disc_findings)
+    if active_probes_on:
+        if verbose:
+            console.print("[bold yellow][!] active-probes: enviando payloads de detección...[/bold yellow]")
+        probe_findings = step(
+            "Sondas activas (SQLi/XSS/SSTI/IDOR/SSRF)",
+            active_probes.run, client, host, manual_param,
+        )
+        host.findings.extend(probe_findings)
+        if verbose:
+            real_findings = [f for f in probe_findings if f.severity != Severity.INFO]
+            for f in probe_findings:
+                if f.severity == Severity.INFO:
+                    console.print(f"[yellow][-] active-probes: {f.title}[/yellow]")
+            if real_findings:
+                console.print(
+                    f"[bold red][!] active-probes: {len(real_findings)} señal(es) a revisar manualmente[/bold red]"
+                )
+            elif not probe_findings:
+                console.print("[green][+] active-probes: sin hallazgos[/green]")
+
+    if verbose:
+        by_source: dict[str, int] = {}
+        for ep in host.endpoints:
+            by_source[ep.source] = by_source.get(ep.source, 0) + 1
+        summary = ", ".join(f"{n} {src}" for src, n in sorted(by_source.items())) or "ninguno"
+        console.print(f"[green][+] Endpoints descubiertos:[/green] {len(host.endpoints)} ({summary})")
+        for f in disc_findings:
+            console.print(f"[bold red][!] {f.title}[/bold red]")
+
     posture.compute_score(host)
     if verbose:
         console.print(f"[bold green][+] Score de postura: {host.score}/100[/bold green]")
@@ -377,7 +450,8 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
 
 
 def run_phase2(client: HttpClient, result: ScanResult, subdomain_mode: bool,
-               deep: bool = False, use_nuclei: bool = False) -> None:
+               deep: bool = False, use_nuclei: bool = False,
+               active_probes_on: bool = False, manual_param: Endpoint | None = None) -> None:
     console.rule("[bold]Fase 2 — Reconocimiento activo[/bold]")
 
     protocol = detect_protocol(client, result.target)
@@ -387,7 +461,8 @@ def run_phase2(client: HttpClient, result: ScanResult, subdomain_mode: bool,
 
     console.print(f"[green][+] Protocolo detectado: {protocol}[/green]\n")
     root_host = evaluate_host(client, result.target, protocol,
-                               deep=deep, use_nuclei=use_nuclei)
+                               deep=deep, use_nuclei=use_nuclei,
+                               active_probes_on=active_probes_on, manual_param=manual_param)
     result.hosts[result.target] = root_host
 
     if result.axfr_results:
@@ -432,20 +507,19 @@ def run_phase2(client: HttpClient, result: ScanResult, subdomain_mode: bool,
 
     console.rule("Comparación de postura de seguridad")
     if use_nuclei:
-        console.print(
-            "[dim]  (nuclei solo se ejecuta sobre el dominio raíz, no por subdominio, "
-            "para no disparar N procesos de nuclei en paralelo)[/dim]"
-        )
-    with console.status(f"[cyan]Evaluando {len(result.subdomains_alive)} subdominios en paralelo...[/cyan]"):
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            futures = {
-                pool.submit(evaluate_host, client, sub, None, True, False, deep, False): sub
-                for sub in result.subdomains_alive
-            }
-            for future in as_completed(futures):
-                host = future.result()
-                result.hosts[host.hostname] = host
-                console.print(f"[dim]  ✓ {host.hostname} (score {host.score})[/dim]")
+        console.print("[dim]  (nuclei solo se ejecuta sobre el dominio raíz)[/dim]")
+    with (
+        console.status(f"[cyan]Evaluando {len(result.subdomains_alive)} subdominios en paralelo...[/cyan]"),
+        ThreadPoolExecutor(max_workers=6) as pool,
+    ):
+        futures = {
+            pool.submit(evaluate_host, client, sub, None, True, False, deep, False): sub
+            for sub in result.subdomains_alive
+        }
+        for future in as_completed(futures):
+            host = future.result()
+            result.hosts[host.hostname] = host
+            console.print(f"[dim]  ✓ {host.hostname} (score {host.score})[/dim]")
 
     sub_hosts = [result.hosts[h] for h in result.subdomains_alive]
     render_posture_table(root_host, sub_hosts)
@@ -461,12 +535,12 @@ def run_phase2(client: HttpClient, result: ScanResult, subdomain_mode: bool,
 def render_posture_table(root_host: HostResult, sub_hosts: list[HostResult]) -> None:
     rows = posture.build_comparison_table(root_host, sub_hosts)
     table = Table(title="Postura de seguridad: dominio raíz vs subdominios")
-    for col in ("Host", "Score", "HSTS", "CSP", "XFO", "Cookies", "WAF", "Vulns"):
+    for col in ("Host", "Score", "HSTS", "CSP", "XFO", "Cookies", "WAF", "Vulns", "Exploits"):
         table.add_column(col)
     for row in rows:
         table.add_row(
             row["host"], str(row["score"]), row["hsts"], row["csp"],
-            row["xfo"], row["cookies"], row["waf"], str(row["vulns"]),
+            row["xfo"], row["cookies"], row["waf"], str(row["vulns"]), row["exploits"],
         )
     console.print(table)
 
@@ -488,17 +562,31 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--nuclei", action="store_true",
                          help="Ejecuta nuclei sobre el dominio raíz (ruidoso; no se "
                               "activa por defecto). Implícito si se usa -d/--deep")
+    parser.add_argument("--active-probes", action="store_true",
+                         help="Sondas de DETECCIÓN activa (SQLi/XSS/SSTI/IDOR/SSRF) contra los "
+                              "parámetros descubiertos. Nunca por defecto; eje independiente de "
+                              "-d/--deep. Nunca marca nada como explotado, solo como señal a "
+                              "verificar manualmente")
+    parser.add_argument("--param", type=active_probes.argparse_param, metavar='"URL?PARAM="',
+                         help="Modo manual de --active-probes: apunta solo a esta URL/parámetro "
+                              "(ej. --param \"https://target.com/search?q=\"), en vez de usar los "
+                              "endpoints descubiertos automáticamente. Implica --active-probes")
+    parser.add_argument("--cookie", type=argparse_cookie, metavar='"NOMBRE=VALOR; ..."',
+                         help="Recon autenticado: cookies de sesión a enviar al objetivo "
+                              "(solo al dominio objetivo y subdominios). Los valores nunca "
+                              "se guardan en los reportes. Ojo: quedan en el historial del "
+                              "shell y en la lista de procesos mientras corren ffuf/nuclei/wpscan")
     return parser
 
 
-def write_reports(result: ScanResult, output_dir: str) -> None:
+def write_reports(result: ScanResult, output_dir: str, secrets: list[str] | None = None) -> None:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     safe_target = result.target.replace("/", "_")
     outdir = Path(output_dir) / f"{safe_target}_{timestamp}"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    markdown_report.write_markdown(result, outdir / "reporte_final.md")
-    json_report.write_json(result, outdir / "reporte_final.json")
+    markdown_report.write_markdown(result, outdir / "reporte_final.md", secrets)
+    json_report.write_json(result, outdir / "reporte_final.json", secrets)
 
     # Mismo patrón que la versión bash: ficheros sueltos además del
     # reporte completo, para quien quiera un `cat`/`grep` rápido sin
@@ -576,14 +664,29 @@ def main() -> None:
     args = build_argparser().parse_args()
     print_banner()
 
-    client = HttpClient()
-    result = ScanResult(target=args.target, mode="subdomain" if args.subdomain else "full")
+    auth = args.cookie  # None si no se pasó --cookie
+    client = HttpClient(auth=auth, scope_domain=args.target if auth else None)
+    active_probes_on = args.active_probes or args.param is not None
+    result = ScanResult(target=args.target, mode="subdomain" if args.subdomain else "full",
+                        authenticated=auth is not None,
+                        cookie_names=auth.names if auth else [],
+                        active_probes_used=active_probes_on)
+    if auth:
+        console.print(f"[bold yellow][!] Recon autenticado[/bold yellow] — cookies: {', '.join(auth.names)} "
+                      "[dim](valores no se muestran ni se guardan)[/dim]\n")
+    if active_probes_on:
+        console.print(
+            "[bold red][!] --active-probes activo[/bold red] — se enviarán payloads de "
+            "detección (nunca de explotación) contra el dominio raíz.\n"
+        )
     exit_code = 0
 
     try:
         run_phase1(client, result, args.subdomain)
         run_phase2(client, result, args.subdomain,
-                   deep=args.deep, use_nuclei=args.nuclei or args.deep)
+                   deep=args.deep, use_nuclei=args.nuclei or args.deep,
+                   active_probes_on=args.active_probes or args.param is not None,
+                   manual_param=args.param)
     except KeyboardInterrupt:
         console.print("\n[bold red][!] Interrumpido por el usuario[/bold red]")
         exit_code = 130
@@ -598,7 +701,7 @@ def main() -> None:
             console.print("\n[dim]Exportación desactivada (-n)[/dim]")
         else:
             try:
-                write_reports(result, args.output)
+                write_reports(result, args.output, auth.secrets() if auth else None)
             except OSError as exc:
                 console.print(f"[red][!] No se pudo escribir el reporte: {exc}[/red]")
 

@@ -10,7 +10,12 @@ import dns.resolver
 import dns.zone
 
 from ..config import (
-    AXFR_TIMEOUT, TXT_PATTERNS, NS_PATTERNS, MX_PATTERNS, CNAME_PATTERNS, CAA_PATTERNS,
+    AXFR_TIMEOUT,
+    CAA_PATTERNS,
+    CNAME_PATTERNS,
+    MX_PATTERNS,
+    NS_PATTERNS,
+    TXT_PATTERNS,
 )
 from ..models import DnsRecordSet
 

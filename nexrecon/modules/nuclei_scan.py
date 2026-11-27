@@ -31,17 +31,21 @@ def nuclei_available() -> bool:
     return shutil.which("nuclei") is not None
 
 
-def run_nuclei(url: str, timeout: int = config.NUCLEI_MAX_SECONDS) -> list[dict]:
+def run_nuclei(url: str, timeout: int = config.NUCLEI_MAX_SECONDS,
+               cookie_header: str | None = None) -> list[dict]:
     """Lanza nuclei con su set de templates por defecto (CVEs,
     misconfiguraciones, exposiciones conocidas...) contra `url`.
     Si no está instalado o se agota el tiempo, devuelve lista vacía
     en vez de propagar la excepción — igual que el resto de wrappers
     de herramientas externas del proyecto.
     """
+    cmd = ["nuclei", "-u", url, "-jsonl", "-silent", "-no-color"]
+    if cookie_header:
+        cmd += ["-H", f"Cookie: {cookie_header}"]
     try:
         proc = subprocess.run(
-            ["nuclei", "-u", url, "-jsonl", "-silent", "-no-color"],
-            capture_output=True, text=True, timeout=timeout,
+            cmd,
+            capture_output=True, text=True, timeout=timeout, check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return []
