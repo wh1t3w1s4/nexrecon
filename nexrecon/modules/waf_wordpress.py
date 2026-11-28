@@ -14,6 +14,9 @@ from collections.abc import Callable
 from .. import config
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# wpscan se auto-aborta en varios casos (el más común: el target redirige a
+# otra URL y exige --ignore-main-redirect) e imprime el motivo en esta forma.
+_SCAN_ABORTED_RE = re.compile(r"Scan Aborted:\s*(.+)")
 
 
 def detect_waf(url: str) -> str | None:
@@ -85,8 +88,16 @@ def run_wpscan(url: str, timeout: int = config.WPSCAN_TIMEOUT_DEFAULT,
     tenga que adivinar por qué "raw" está vacío:
       - "raw": salida filtrada (string, puede ser "")
       - "lines": lista de líneas crudas (para clasificar hallazgos)
-      - "timed_out": True si se agotó el tiempo
-      - "error": motivo legible si algo falló, o "" si todo fue normal
+      - "timed_out": True si se agotó el tiempo — NO implica "raw" vacío:
+        es una bandera informativa aparte, no excluyente. El chequeo de
+        tiempo se evalúa en cada línea leída, incluida la última antes del
+        EOF natural; si el proceso ya había terminado de producir toda su
+        salida justo cuando se cruza el umbral, se captura igualmente —
+        tirar un escaneo completo solo porque el drenado del pipe tardó
+        un pelín de más sería peor que quedarse con salida parcial.
+      - "error": motivo legible si algo falló (incluye "Scan Aborted: ..."
+        si wpscan aborta solo, p. ej. por una redirección — eso NO es un
+        escaneo exitoso aunque imprima algo de texto), o "" si todo bien.
       - "db_outdated": True si wpscan avisó de que su BD lleva tiempo
         sin actualizar (no es un fallo, solo una recomendación)
     """
@@ -128,9 +139,6 @@ def run_wpscan(url: str, timeout: int = config.WPSCAN_TIMEOUT_DEFAULT,
         proc.kill()
         timed_out = timed_out or (time.monotonic() - start > timeout)
 
-    if timed_out:
-        return {"timed_out": True, "raw": "", "lines": lines, "error": "", "db_outdated": False}
-
     full_output = "\n".join(lines)
     skip_patterns = (
         "Requests Done", "Cached Requests", "Data Sent",
@@ -138,14 +146,18 @@ def run_wpscan(url: str, timeout: int = config.WPSCAN_TIMEOUT_DEFAULT,
     )
     filtered = [l for l in lines if not any(p in l for p in skip_patterns)]
     raw = "\n".join(filtered).strip()
-
-    error = ""
-    if not raw and proc.returncode not in (0, None):
-        error = f"wpscan terminó con código {proc.returncode}"
-
     db_outdated = "have not updated the database" in full_output.lower()
 
-    return {"timed_out": False, "raw": raw, "lines": lines, "error": error, "db_outdated": db_outdated}
+    # wpscan puede auto-abortar (p. ej. el target redirige a otra URL y
+    # sugiere --ignore-main-redirect) e igualmente imprimir texto — eso
+    # hace que `raw` no esté vacío aunque el escaneo real nunca ocurrió.
+    # Sin esto, se reportaría como un escaneo exitoso con "salida".
+    abort_match = _SCAN_ABORTED_RE.search(full_output)
+    error = f"Scan Aborted: {abort_match.group(1).strip()}" if abort_match else ""
+    if not error and not raw and not timed_out and proc.returncode not in (0, None):
+        error = f"wpscan terminó con código {proc.returncode}"
+
+    return {"timed_out": timed_out, "raw": raw, "lines": lines, "error": error, "db_outdated": db_outdated}
 
 
 def extract_wordpress_findings(lines: list[str]) -> list[dict]:

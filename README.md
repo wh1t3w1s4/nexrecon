@@ -30,8 +30,9 @@ python3 -m nexrecon.cli ejemplo.com
 | `-s, --subdomain` | Modo subdominio: omite WHOIS/DNS extra/descubrimiento |
 | `--nuclei` | Ejecuta nuclei sobre el dominio raíz (ruidoso). Implícito con `-d/--deep` |
 | `--cookie "A=1; B=2"` | Recon autenticado: envía esas cookies solo al dominio objetivo y sus subdominios (también a ffuf, whatweb, nuclei y wpscan). Los valores nunca se guardan en los reportes, solo los nombres |
-| `--active-probes` | Sondas de DETECCIÓN activa (SQLi/XSS/SSTI/IDOR/SSRF) sobre los endpoints descubiertos. Nunca por defecto; eje independiente de `-d/--deep`. Solo sobre el dominio raíz, nunca por subdominio. Ningún hallazgo se marca como explotado, solo como señal a verificar manualmente |
+| `--active-probes` | Sondas de DETECCIÓN activa (SQLi/XSS/SSTI/IDOR/SSRF/open redirect/LFI) sobre los endpoints descubiertos. Nunca por defecto; eje independiente de `-d/--deep`. Solo sobre el dominio raíz, nunca por subdominio. Ningún hallazgo se marca como explotado, solo como señal a verificar manualmente |
 | `--param "URL?PARAM="` | Modo manual de `--active-probes`: apunta solo a esa URL/parámetro en vez de usar los endpoints descubiertos automáticamente. Implica `--active-probes` |
+| `--no-osv` | Desactiva la consulta a OSV.dev (API pública externa). Útil en redes air-gapped/offline |
 
 ## Qué incluye ya
 
@@ -43,12 +44,26 @@ python3 -m nexrecon.cli ejemplo.com
   tabla `rich` y detección de eslabón débil.
 - `searchsploit` (base offline de exploit-db) sobre CVEs confirmados por
   `VULN_DB` y por tecnología detectada.
+- Enriquecimiento de vulnerabilidades vía OSV.dev (`--no-osv` para desactivarlo)
+  para tecnologías con ecosistema conocido (npm: jQuery, Bootstrap, Lodash,
+  React, Vue...); aumenta a `VULN_DB`, no lo sustituye.
 - Descubrimiento de endpoints: formularios HTML, enlaces con query, JS
-  propio del host (nunca de terceros) y detección de `.js.map` expuestos.
+  propio del host (nunca de terceros), detección de `.js.map` expuestos y
+  escaneo de secretos filtrados en los bundles JS (claves AWS/GitHub/Slack/
+  Stripe, JWTs, bloques de clave privada, genéricos por entropía), con los
+  valores siempre enmascarados en el reporte.
+- Verificación activa de subdomain takeover: confirma (no solo anota) los
+  CNAME colgantes sobre proveedores conocidos (GitHub Pages, S3, Heroku,
+  Azure, Fastly, Shopify, Zendesk...).
+- Comprobación de CORS (origen reflejado, `Origin: null`) sin payloads,
+  siempre activa.
 - Recon autenticado (`--cookie`): sesión acotada al dominio objetivo,
   nunca se guardan los valores en los reportes.
 - `--active-probes`: sondas de detección (no explotación) de SQLi, XSS
-  reflejado, SSTI, IDOR y candidatos a SSRF sobre los endpoints descubiertos.
+  reflejado, SSTI (varios motores de plantillas), IDOR, open redirect, LFI
+  y candidatos a SSRF sobre los endpoints descubiertos.
+- Modelo de confianza (`Confidence`: certain/firm/tentative) independiente
+  de la severidad en cada hallazgo, que modula el score de postura.
 - Integración opcional con `nuclei` (`--nuclei`/`-d`).
 - Export a Markdown y JSON.
 - Feedback en vivo (spinners `rich.status()`) en cada paso largo del host

@@ -18,13 +18,16 @@ Reglas del diseño:
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
+from dataclasses import dataclass
 from urllib.parse import parse_qsl, urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
 from ..http_client import HttpClient
-from ..models import Endpoint, Finding, HostResult, Severity
+from ..models import Confidence, Endpoint, Finding, HostResult, Severity
 
 MODULE_NAME = "endpoint_discovery"
 
@@ -58,6 +61,106 @@ _JS_API_STRING = re.compile(
 _JS_ROUTE = re.compile(r"""\bpath\s*:\s*[`'"](/[^`'"\s]*)[`'"]""")
 _JS_TEMPLATE_EXPR = re.compile(r"\$\{[^}]*\}")
 _SOURCEMAP_COMMENT = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)\s*$", re.MULTILINE)
+
+
+# ------------------------------------------------------------- secretos JS
+
+@dataclass(frozen=True)
+class SecretPattern:
+    name: str
+    regex: re.Pattern
+    severity: Severity
+    confidence: Confidence
+    note: str = ""   # p. ej. "las API keys de Google Maps suelen ser públicas por diseño"
+
+
+_SECRET_PATTERNS: list[SecretPattern] = [
+    SecretPattern("AWS Access Key ID", re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+                  Severity.HIGH, Confidence.FIRM),
+    SecretPattern("Google API Key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),
+                  Severity.LOW, Confidence.FIRM,
+                  "Puede ser una clave pública de cliente (Maps/JS) — verificar restricciones."),
+    SecretPattern("Slack Token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"),
+                  Severity.HIGH, Confidence.CERTAIN),
+    SecretPattern("Stripe Live Secret Key", re.compile(r"\b[sr]k_live_[0-9A-Za-z]{24,}\b"),
+                  Severity.CRITICAL, Confidence.CERTAIN),
+    SecretPattern("GitHub Token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[0-9A-Za-z_]{36,}\b"),
+                  Severity.HIGH, Confidence.CERTAIN),
+    SecretPattern("Private Key block", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
+                  Severity.CRITICAL, Confidence.CERTAIN),
+    SecretPattern("Twilio Account SID", re.compile(r"\bAC[0-9a-fA-F]{32}\b"),
+                  Severity.MEDIUM, Confidence.FIRM),
+    SecretPattern("Mailgun/Generic key", re.compile(r"\bkey-[0-9a-zA-Z]{32}\b"),
+                  Severity.MEDIUM, Confidence.FIRM),
+    SecretPattern("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+                  Severity.MEDIUM, Confidence.TENTATIVE, "Puede ser un token de ejemplo/expirado."),
+    # genérico, siempre TENTATIVE y filtrado por entropía (ver `_is_plausible_secret`):
+    SecretPattern(
+        "Posible credencial genérica",
+        re.compile(
+            r"""(?i)(?:api[_-]?key|secret|token|passwd|password|access[_-]?key)\s*[:=]\s*['"]([^'"\s]{12,})['"]"""
+        ),
+        Severity.MEDIUM, Confidence.TENTATIVE,
+    ),
+]
+
+_PLACEHOLDER_RE = re.compile(
+    r"(?i)^(?:x{3,}|your|example|test|dummy|changeme|placeholder|<[^>]+>|\$\{|\{\{|null|undefined)"
+)
+_MIN_GENERIC_ENTROPY = 3.2  # bits/char; texto natural ronda 2.5-3, secretos aleatorios 4+
+MAX_SECRET_FINDINGS = 25
+
+
+def _shannon_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    counts = Counter(value)
+    length = len(value)
+    return -sum((n / length) * math.log2(n / length) for n in counts.values())
+
+
+def _is_plausible_secret(value: str) -> bool:
+    if _PLACEHOLDER_RE.match(value):
+        return False
+    return _shannon_entropy(value) >= _MIN_GENERIC_ENTROPY
+
+
+def _mask(value: str) -> str:
+    if len(value) <= 8:
+        return value
+    return f"{value[:4]}…{value[-2:]} ({len(value)} car.)"
+
+
+def scan_js_secrets(js: str, script_url: str, seen: set[str]) -> list[Finding]:
+    """Escanea un bundle JS ya descargado en busca de credenciales filtradas.
+
+    Coste marginal casi nulo: `js` ya está en memoria (se descargó para
+    `extract_js_endpoints`/`check_source_map`), esto es solo más regex sobre
+    el mismo texto. `seen` deduplica el mismo valor visto en otro script del
+    mismo host (p. ej. una clave repetida en varios bundles).
+    """
+    findings: list[Finding] = []
+    for pattern in _SECRET_PATTERNS:
+        for match in pattern.regex.finditer(js):
+            if len(findings) + len(seen) >= MAX_SECRET_FINDINGS:
+                return findings
+            # Los patrones con grupo de captura son el genérico (clave=valor);
+            # el resto matchea el secreto completo (no tienen grupos).
+            value = match.group(1) if match.groups() else match.group(0)
+            if pattern.confidence is Confidence.TENTATIVE and not _is_plausible_secret(value):
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            detail = f"Valor: {_mask(value)}, encontrado en {script_url}."
+            if pattern.note:
+                detail += f" {pattern.note}"
+            findings.append(Finding(
+                title=f"Posible secreto filtrado en JS: {pattern.name}",
+                severity=pattern.severity, detail=detail, module=MODULE_NAME,
+                confidence=pattern.confidence,
+            ))
+    return findings
 
 
 # --------------------------------------------------------------- utilidades
@@ -229,9 +332,10 @@ def _candidate_pages(host: HostResult, base_url: str) -> list[str]:
 
 
 def discover(client: HttpClient, host: HostResult, base_url: str) -> list[Finding]:
-    """Rellena `host.endpoints` y devuelve hallazgos (source maps)."""
+    """Rellena `host.endpoints` y devuelve hallazgos (source maps, secretos en JS)."""
     findings: list[Finding] = []
     seen: dict[tuple, Endpoint] = {}
+    seen_secrets: set[str] = set()  # dedup de valores repetidos entre scripts de este host
 
     def add(ep: Endpoint) -> None:
         if len(seen) < MAX_ENDPOINTS:
@@ -247,6 +351,10 @@ def discover(client: HttpClient, host: HostResult, base_url: str) -> list[Findin
             if _same_host(ep.url, base_url):
                 add(ep)
         scripts += [s for s in page_scripts if _same_host(s, base_url)]  # solo JS propio
+        if page == base_url:
+            # Secretos en <script> inline de la página raíz — barato, ya se
+            # descargó el HTML para parsear formularios/enlaces.
+            findings += scan_js_secrets(res.text, f"HTML inline de {page}", seen_secrets)
 
     for script_url in list(dict.fromkeys(scripts))[:MAX_SCRIPTS]:
         res = client.get(script_url)
@@ -258,6 +366,7 @@ def discover(client: HttpClient, host: HostResult, base_url: str) -> list[Findin
         finding = check_source_map(client, script_url, js, base_url)
         if finding:
             findings.append(finding)
+        findings += scan_js_secrets(js, script_url, seen_secrets)
 
     host.endpoints = sorted(seen.values(), key=lambda e: (e.source, e.url, e.method))
     return findings

@@ -31,6 +31,18 @@ SEVERITY_RANK = {
 }
 
 
+class Confidence(str, Enum):
+    """Qué tan seguros estamos de que el hallazgo es real, independiente
+    de su severidad (severidad = impacto si es real; confianza = cuánto
+    nos fiamos de que lo sea). Escala de 3 niveles estilo Burp Suite.
+    """
+    CERTAIN = "certain"      # confirmado por prueba determinista (p. ej. SSTI doble-confirmado)
+    FIRM = "firm"            # señal fuerte pero no probada (reflejo XSS, error SQL nuevo)
+    TENTATIVE = "tentative"  # heurística/indicio (candidato SSRF, secreto genérico por entropía)
+
+CONFIDENCE_RANK = {Confidence.CERTAIN: 0, Confidence.FIRM: 1, Confidence.TENTATIVE: 2}
+
+
 @dataclass
 class Finding:
     """Un hallazgo individual: una vulnerabilidad, una mala configuración,
@@ -43,6 +55,7 @@ class Finding:
     detail: str = ""
     reference: str = ""
     module: str = ""  # qué módulo lo generó (whatweb, cookies, waf...)
+    confidence: Confidence = Confidence.FIRM  # FIRM = no cambia hallazgos existentes
 
 
 @dataclass
@@ -89,6 +102,9 @@ class VulnMatch:
     cve: str
     description: str
     reference: str
+    source: str = "vuln_db"  # "vuln_db" (estático) u "osv" (OSV.dev)
+    confidence: Confidence = Confidence.FIRM
+    cvss: str = ""  # vector/score si la fuente lo da (p. ej. OSV); "" si no aplica
 
 
 @dataclass
@@ -145,8 +161,9 @@ class HostResult:
     score: int = 60
 
     def add_finding(self, title: str, severity: Severity, detail: str = "",
-                     reference: str = "", module: str = "") -> None:
-        self.findings.append(Finding(title, severity, detail, reference, module))
+                     reference: str = "", module: str = "",
+                     confidence: Confidence = Confidence.FIRM) -> None:
+        self.findings.append(Finding(title, severity, detail, reference, module, confidence))
 
     def findings_by_severity(self, severity: Severity) -> list[Finding]:
         return [f for f in self.findings if f.severity == severity]

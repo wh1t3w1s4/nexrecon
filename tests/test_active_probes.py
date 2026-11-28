@@ -269,3 +269,76 @@ def test_run_respects_max_endpoints_and_params_only_endpoints():
     ap.run(client, host)
     urls_hit = {c["url"] for c in client.calls}
     assert "https://t.example/no-params" not in urls_hit
+
+
+# --------------------------------------------------------------- open redirect
+
+def test_open_redirect_detected_on_redirect_param():
+    def responder(method, url, params):
+        if params.get("next", "").startswith("https://nxr-redirect.invalid"):
+            return FetchResult(ok=True, status_code=302, headers={"Location": params["next"]}, text="")
+        return ok("normal page")
+    client = FakeClient(responder)
+    findings = ap.probe_endpoint(client, ep({"next": "/home"}), authenticated=False)
+    redirects = [f for f in findings if "Open redirect" in f.title]
+    assert len(redirects) == 1
+    assert redirects[0].severity == Severity.MEDIUM
+
+
+def test_open_redirect_oauth_like_param_is_high():
+    def responder(method, url, params):
+        if "nxr-redirect.invalid" in params.get("redirect_uri", ""):
+            return FetchResult(ok=True, status_code=302,
+                               headers={"Location": params["redirect_uri"]}, text="")
+        return ok("normal page")
+    client = FakeClient(responder)
+    findings = ap.probe_endpoint(client, ep({"redirect_uri": "/cb"}), authenticated=False)
+    redirects = [f for f in findings if "Open redirect" in f.title]
+    assert len(redirects) == 1 and redirects[0].severity == Severity.HIGH
+
+
+def test_open_redirect_skipped_for_non_redirect_param_name():
+    def responder(method, url, params):
+        return FetchResult(ok=True, status_code=302, headers={"Location": "https://nxr-redirect.invalid/"}, text="")
+    client = FakeClient(responder)
+    findings = ap.probe_endpoint(client, ep({"q": "x"}), authenticated=False)
+    assert not any("Open redirect" in f.title for f in findings)
+
+
+def test_open_redirect_not_flagged_when_redirect_stays_internal():
+    def responder(method, url, params):
+        return FetchResult(ok=True, status_code=302, headers={"Location": "/home"}, text="")
+    client = FakeClient(responder)
+    findings = ap.probe_endpoint(client, ep({"next": "/home"}), authenticated=False)
+    assert not any("Open redirect" in f.title for f in findings)
+
+
+# --------------------------------------------------------------------- LFI
+
+def test_lfi_etc_passwd_detected():
+    def responder(method, url, params):
+        if "etc/passwd" in params.get("file", "") or "etc%2fpasswd" in params.get("file", "").lower():
+            return ok("root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1::/usr/sbin:/usr/sbin/nologin")
+        return ok("archivo no encontrado")
+    client = FakeClient(responder)
+    findings = ap.probe_endpoint(client, ep({"file": "doc.txt"}), authenticated=False)
+    lfi = [f for f in findings if "LFI" in f.title]
+    assert len(lfi) == 1 and lfi[0].severity == Severity.HIGH
+
+
+def test_lfi_not_flagged_when_passwd_string_already_in_baseline():
+    def responder(method, url, params):
+        return ok("root:x:0:0:root:/root:/bin/bash")  # siempre presente, incluso sin payload
+    client = FakeClient(responder)
+    findings = ap.probe_endpoint(client, ep({"file": "doc.txt"}), authenticated=False)
+    assert not any("LFI" in f.title for f in findings)
+
+
+def test_lfi_windows_variant_detected():
+    def responder(method, url, params):
+        if "win.ini" in params.get("file", ""):
+            return ok("[extensions]\nfor 16-bit app support")
+        return ok("not found")
+    client = FakeClient(responder)
+    findings = ap.probe_endpoint(client, ep({"file": "doc.txt"}), authenticated=False)
+    assert any("LFI" in f.title for f in findings)

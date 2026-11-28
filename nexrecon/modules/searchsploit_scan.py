@@ -27,7 +27,7 @@ import re
 import shutil
 import subprocess
 
-from ..models import SEVERITY_RANK, Finding, HostResult, Severity
+from ..models import SEVERITY_RANK, Confidence, Finding, HostResult, Severity
 
 MODULE_NAME = "searchsploit"
 TAG_CONFIRMED = "[CVE confirmado]"
@@ -168,6 +168,12 @@ def _build_finding(result: dict, confirmed: bool, source_cve: str | None) -> Fin
     severity = classify_severity(title, exploit_type)
 
     tag = TAG_CONFIRMED if confirmed else TAG_UNCONFIRMED
+    # CONFIRMADO: tan fiable como VULN_DB (aún con sus caveats de fingerprinting
+    # HTTP, por eso FIRM y no CERTAIN). SIN CONFIRMAR: empareja por texto del
+    # título contra la tecnología detectada, no por versión real — mucho más
+    # ruidoso, de ahí TENTATIVE (antes ambos caían en el mismo FIRM por defecto,
+    # sin que el grado de confianza reflejara esa diferencia ya documentada).
+    confidence = Confidence.FIRM if confirmed else Confidence.TENTATIVE
     detail_parts = [f"EDB-ID {edb_id}", f"tipo: {exploit_type or 'desconocido'}"]
     if source_cve:
         detail_parts.append(f"vía {source_cve}")
@@ -178,6 +184,7 @@ def _build_finding(result: dict, confirmed: bool, source_cve: str | None) -> Fin
         severity=severity,
         detail=", ".join(detail_parts),
         module=MODULE_NAME,
+        confidence=confidence,
     )
 
 

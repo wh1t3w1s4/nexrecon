@@ -83,6 +83,35 @@ def resolve_a(domain: str, timeout: float = 5.0) -> list[str]:
     return rs.values
 
 
+def resolve_cname(hostname: str, timeout: float = 5.0) -> str | None:
+    """CNAME directo de `hostname`, o None si no tiene / no se pudo resolver."""
+    try:
+        answer = dns.resolver.resolve(hostname, "CNAME", lifetime=timeout)
+        return str(answer[0].target).rstrip(".").lower()
+    except Exception:
+        return None
+
+
+def resolves(hostname: str, timeout: float = 5.0) -> bool:
+    """True si el nombre resuelve a algo (A/AAAA), False si NXDOMAIN —
+    la señal clave para un CNAME colgante (subdomain takeover): el
+    subdominio sigue apuntando a un servicio de terceros que ya no existe.
+
+    Ante cualquier otro error (timeout, sin respuesta de los NS...) se
+    asume True: mejor un falso negativo de takeover que afirmar NXDOMAIN
+    sin estar seguros.
+    """
+    for rtype in ("A", "AAAA"):
+        try:
+            dns.resolver.resolve(hostname, rtype, lifetime=timeout)
+            return True
+        except dns.resolver.NXDOMAIN:
+            return False
+        except Exception:
+            continue
+    return True
+
+
 def attempt_axfr(domain: str, nameservers: list[str],
                   timeout: float = AXFR_TIMEOUT) -> dict[str, list[str]]:
     """Intenta una transferencia de zona (AXFR) contra cada nameserver

@@ -36,8 +36,10 @@ def _host_section(host: HostResult) -> str:
     if host.vulns:
         lines.append("**Vulnerabilidades por versión:**\n")
         for vuln in host.vulns:
-            lines.append(f"- **{vuln.cve}** — {vuln.technology} {vuln.detected_version} "
-                         f"(corregido en {vuln.fixed_in})")
+            source_tag = f" `[{vuln.source.upper()}]`"
+            cvss_tag = f" — CVSS: {vuln.cvss}" if vuln.cvss else ""
+            lines.append(f"- **{vuln.cve}**{source_tag} — {vuln.technology} {vuln.detected_version} "
+                         f"(corregido en {vuln.fixed_in}){cvss_tag}")
             if vuln.description:
                 lines.append(f"  {vuln.description}")
             if vuln.reference:
@@ -49,14 +51,19 @@ def _host_section(host: HostResult) -> str:
         lines.append(
             "_Nota: \"Vulnerabilidades por versión\" (arriba) es exclusivamente "
             "VULN_DB; esta lista mezcla el resto de módulos (cabeceras, cookies, "
-            "WAF, DNS/AXFR, fuzzing, descubrimiento de endpoints, sondas activas, searchsploit y nuclei si se usó --nuclei/--deep), "
+            "WAF, CORS, DNS/AXFR, fuzzing, descubrimiento de endpoints (incluye secretos "
+            "filtrados en JS), sondas activas (incluye open redirect/LFI), searchsploit, "
+            "OSV.dev, subdomain takeover y nuclei si se usó --nuclei/--deep), "
             "identificados entre corchetes._\n"
         )
         for finding in sorted(host.findings,
                               key=lambda f: SEVERITY_RANK.get(f.severity, 9)):
             icon = _SEVERITY_ICON.get(finding.severity, "")
             module_tag = f" `[{finding.module}]`" if finding.module else ""
-            lines.append(f"- {icon} **[{finding.severity.value.upper()}] {finding.title}**{module_tag}")
+            lines.append(
+                f"- {icon} **[{finding.severity.value.upper()}] {finding.title}**{module_tag} "
+                f"_(confianza: {finding.confidence.value})_"
+            )
             if finding.detail:
                 lines.append(f"  {finding.detail}")
             if finding.reference:
@@ -99,14 +106,21 @@ def _host_section(host: HostResult) -> str:
 
     if host.wordpress:
         lines.append("**WordPress (wpscan):**\n")
-        if host.wordpress.get("timed_out"):
-            lines.append("_wpscan se agotó por tiempo antes de completar — sin resultados._\n")
-        elif host.wordpress.get("error"):
-            lines.append(f"_wpscan no completó: {host.wordpress['error']}_\n")
-        elif host.wordpress.get("raw"):
+        wp = host.wordpress
+        if wp.get("error"):
+            # Excluyente: si wpscan se autoabortó (p. ej. redirect) o falló,
+            # eso manda aunque haya impreso algo de texto — no es un escaneo
+            # real, por mucho que "raw" no esté vacío.
+            lines.append(f"_wpscan no completó: {wp['error']}_\n")
+        elif wp.get("raw"):
+            if wp.get("timed_out"):
+                lines.append("_wpscan se agotó por tiempo — esto es la salida parcial capturada "
+                              "antes del corte, no un escaneo completo:_\n")
             lines.append("```")
-            lines.append(host.wordpress["raw"][:4000])
+            lines.append(wp["raw"][:4000])
             lines.append("```\n")
+        elif wp.get("timed_out"):
+            lines.append("_wpscan se agotó por tiempo antes de completar — sin resultados._\n")
         else:
             lines.append("_wpscan corrió correctamente, sin hallazgos relevantes en modo passive._\n")
 

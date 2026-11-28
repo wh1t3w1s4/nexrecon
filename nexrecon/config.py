@@ -57,6 +57,31 @@ NUCLEI_MAX_SECONDS = int(os.environ.get("NEXRECON_NUCLEI_MAX_SECONDS", "300"))
 # tiene sentido esperar mucho por un nameserver bien configurado.
 AXFR_TIMEOUT = float(os.environ.get("NEXRECON_AXFR_TIMEOUT", "10"))
 
+# OSV.dev: enriquece VULN_DB (17 entradas estáticas) con CVEs en vivo, pero
+# OSV empareja por (ecosistema, paquete, versión), no por texto libre — por
+# eso solo se consulta para tecnologías con un ecosistema conocido (ver
+# OSV_ECOSYSTEM_MAP más abajo). OSV AUMENTA a VULN_DB, no lo sustituye: su
+# cobertura es excelente para librerías JS/paquetes de lenguaje, pero pobre
+# o dependiente de la distro para nginx/Apache/PHP-core.
+OSV_API_URL = "https://api.osv.dev/v1/query"
+OSV_ENABLED = os.environ.get("NEXRECON_OSV", "1") != "0"
+OSV_TIMEOUT = int(os.environ.get("NEXRECON_OSV_TIMEOUT", "15"))
+
+# tech (en minúsculas, como lo devuelve whatweb) -> (ecosistema OSV, nombre de paquete)
+OSV_ECOSYSTEM_MAP: dict[str, tuple[str, str]] = {
+    "jquery": ("npm", "jquery"),
+    "bootstrap": ("npm", "bootstrap"),
+    "lodash": ("npm", "lodash"),
+    "angularjs": ("npm", "angular"),
+    "angular": ("npm", "@angular/core"),
+    "react": ("npm", "react"),
+    "vue": ("npm", "vue"),
+    "moment.js": ("npm", "moment"),
+    "handlebars": ("npm", "handlebars"),
+    "dompurify": ("npm", "dompurify"),
+    # ampliable: PyPI (django, flask), Packagist, etc.
+}
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
@@ -175,6 +200,29 @@ CAA_PATTERNS = {
     "sectigo.com": "Autoriza a Sectigo/Comodo a emitir certificados",
     "comodoca.com": "Autoriza a Sectigo/Comodo a emitir certificados",
 }
+
+@dataclass(frozen=True)
+class TakeoverSignature:
+    service: str
+    cname_contains: tuple[str, ...]      # subcadenas del CNAME destino
+    body_fingerprints: tuple[str, ...]   # cadenas en el cuerpo HTTP que confirman recurso no reclamado
+    vulnerable: bool                     # algunos servicios ya no son explotables; se reporta igual, matizado
+
+
+# Basado en can-i-take-over-xyz (https://github.com/EdOverflow/can-i-take-over-xyz).
+TAKEOVER_SIGNATURES: list[TakeoverSignature] = [
+    TakeoverSignature("GitHub Pages", ("github.io",),
+                      ("There isn't a GitHub Pages site here",), True),
+    TakeoverSignature("AWS S3", ("s3.amazonaws.com", "s3-website", "amazonaws.com"),
+                      ("NoSuchBucket", "The specified bucket does not exist"), True),
+    TakeoverSignature("Heroku", ("herokuapp.com", "herokudns.com"),
+                      ("No such app", "herokucdn.com/error-pages/no-such-app.html"), True),
+    TakeoverSignature("Azure", ("azurewebsites.net", "cloudapp.net", "trafficmanager.net", "blob.core.windows.net"),
+                      ("404 Web Site not found",), True),
+    TakeoverSignature("Fastly", ("fastly.net",), ("Fastly error: unknown domain",), True),
+    TakeoverSignature("Shopify", ("myshopify.com",), ("Sorry, this shop is currently unavailable",), False),
+    TakeoverSignature("Zendesk", ("zendesk.com",), ("Help Center Closed",), False),
+]
 
 BYPASS_403_PATH_SUFFIXES = ["/", "/.", "%20", "%09", "..;/"]
 BYPASS_403_HEADERS = [

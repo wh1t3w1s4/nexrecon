@@ -117,3 +117,70 @@ def test_spa_fallback_is_not_a_sourcemap():
 def test_endpoint_from_url_manual():
     ep = ed.endpoint_from_url("https://t.example/search?q=&secret_key=zz#frag")
     assert ep.url == "https://t.example/search" and ep.params == {"q": "", "secret_key": ""}
+
+
+# ------------------------------------------------------------ secretos JS
+
+def test_aws_key_detected_high_firm_and_masked_in_detail():
+    js = 'var cfg = {key: "AKIAABCDEFGHIJKLMNOP"};'
+    findings = ed.scan_js_secrets(js, "https://t.example/app.js", set())
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.severity.value == "high"
+    assert f.confidence.value == "firm"
+    assert "AKIAABCDEFGHIJKLMNOP" not in f.detail
+    assert "AKIA" in f.detail  # el valor enmascarado sí conserva el prefijo
+
+
+def test_generic_placeholder_not_flagged():
+    js = 'const apiKey = "YOUR_API_KEY_HERE";'
+    findings = ed.scan_js_secrets(js, "https://t.example/app.js", set())
+    assert findings == []
+
+
+def test_generic_low_entropy_text_not_flagged():
+    js = 'const secret = "helloworldhelloworld";'  # 20+ car. pero baja entropía
+    findings = ed.scan_js_secrets(js, "https://t.example/app.js", set())
+    assert findings == []
+
+
+def test_generic_high_entropy_secret_is_tentative():
+    js = 'const token = "qX7!zR9m$2vLpK8wN3tY";'
+    findings = ed.scan_js_secrets(js, "https://t.example/app.js", set())
+    assert len(findings) == 1
+    assert findings[0].confidence.value == "tentative"
+
+
+def test_same_secret_in_two_scripts_counts_once():
+    js = 'var cfg = {key: "AKIAABCDEFGHIJKLMNOP"};'
+    seen: set[str] = set()
+    first = ed.scan_js_secrets(js, "https://t.example/a.js", seen)
+    second = ed.scan_js_secrets(js, "https://t.example/b.js", seen)
+    assert len(first) == 1
+    assert len(second) == 0
+
+
+def test_slack_token_is_certain():
+    # Construido en runtime, no como literal, para que no parezca un token
+    # real de Slack a los escáneres de secretos de GitHub al hacer push.
+    fake_token = "xoxb-" + "1" * 12 + "-" + "a" * 15
+    js = f'const t = "{fake_token}";'
+    findings = ed.scan_js_secrets(js, "https://t.example/app.js", set())
+    assert len(findings) == 1 and findings[0].confidence.value == "certain"
+
+
+def test_private_key_block_detected():
+    js = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----"
+    findings = ed.scan_js_secrets(js, "https://t.example/app.js", set())
+    assert any("Private Key" in f.title for f in findings)
+    assert findings[0].severity.value == "critical"
+
+
+def test_discover_scans_js_for_secrets_end_to_end():
+    client = FakeClient({
+        BASE: '<script src="/app.js"></script>',
+        BASE + "/app.js": 'fetch("/api/me"); var k = "AKIAABCDEFGHIJKLMNOP";',
+    })
+    host = HostResult(hostname="t.example")
+    findings = ed.discover(client, host, BASE)
+    assert any("AWS" in f.title for f in findings)

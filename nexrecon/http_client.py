@@ -98,17 +98,20 @@ class HttpClient:
         return random.choice(config.USER_AGENTS)
 
     def request(self, method: str, url: str, params: dict[str, str] | None = None,
-                data: dict[str, str] | None = None, headers: dict[str, str] | None = None,
+                data: dict[str, str] | None = None, json_body: dict | list | None = None,
+                headers: dict[str, str] | None = None,
                 allow_redirects: bool = True, timeout: int | None = None) -> FetchResult:
-        """Punto de entrada genérico. `get()` es un atajo sobre este para no
-        romper las llamadas existentes en el resto de módulos.
+        """Punto de entrada genérico. `get()`/`post()` son atajos sobre este
+        para no romper las llamadas existentes en el resto de módulos.
+        `json_body` es para APIs que esperan JSON de verdad (p. ej. OSV.dev),
+        no form-data — `.post()` solo cubre ese segundo caso.
         """
         req_headers = {"User-Agent": self.random_ua()}
         if headers:
             req_headers.update(headers)
         try:
             resp = self._session().request(
-                method, url, params=params, data=data, headers=req_headers,
+                method, url, params=params, data=data, json=json_body, headers=req_headers,
                 allow_redirects=allow_redirects, timeout=timeout or self.timeout,
             )
             try:

@@ -27,6 +27,7 @@ from .models import Endpoint, HostResult, ScanResult, Severity
 from .modules import (
     active_probes,
     bypass403,
+    cors,
     dns_recon,
     endpoint_discovery,
     fingerprint,
@@ -34,9 +35,11 @@ from .modules import (
     headers_cookies,
     ip_intel,
     nuclei_scan,
+    osv,
     posture,
     searchsploit_scan,
     subdomains,
+    takeover,
     vuln_db,
     waf_wordpress,
 )
@@ -46,8 +49,7 @@ console = Console()
 
 
 def print_banner() -> None:
-    console.print("[bold cyan]Nexrecon[/bold cyan] [yellow]v0.2.0[/yellow] — by w1s4")
-    console.print("[dim]Reconocimiento web para auditorías autorizadas[/dim]\n")
+    console.print("[bold cyan]Nexrecon[/bold cyan] [yellow]v0.3.0[/yellow] — by w1s4\n")
 
 
 def detect_protocol(client: HttpClient, domain: str) -> str | None:
@@ -184,7 +186,14 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
             console.print("[green][+] Tecnologías:[/green]", techs)
 
     step("Analizando cabeceras y cookies", headers_cookies.analyze, client, host, base_url)
+    cors_findings = step("Comprobando CORS", cors.check, client, host, base_url)
+    host.findings.extend(cors_findings)
+    if verbose and cors_findings:
+        console.print(f"[red][!] CORS: {len(cors_findings)} hallazgo(s)[/red]")
     host.vulns = vuln_db.check_technologies(host)
+    if config.OSV_ENABLED:
+        static_cves = {c.strip() for v in host.vulns for c in v.cve.split(",")}
+        host.vulns += step("Consultando OSV.dev", osv.enrich, client, host, static_cves)
     if verbose:
         if host.vulns:
             console.print(f"[red][!] {len(host.vulns)} vulnerabilidad(es) conocidas por versión[/red]")
@@ -238,9 +247,7 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
                     module="wordpress",
                 )
 
-            if verbose:
-                console.print("[green][+] Actualizando base de datos de wpscan...[/green]")
-            update_result = step("wpscan --update", waf_wordpress.update_wpscan_db)
+            update_result = step("Actualizando base de datos de wpscan", waf_wordpress.update_wpscan_db)
             if verbose and not update_result["ok"]:
                 console.print(f"[dim]  wpscan --update: {update_result['output'][:120]}[/dim]")
 
@@ -269,27 +276,38 @@ def evaluate_host(client: HttpClient, hostname: str, protocol: str | None = None
             # Superficie explícita del resultado: antes un timeout o un fallo
             # de wpscan quedaba indistinguible de "corrió bien y no encontró
             # nada", y en el reporte salía un bloque vacío sin explicación.
-            if host.wordpress.get("timed_out"):
-                host.add_finding(
-                    "wpscan se agotó por tiempo", Severity.INFO,
-                    f"Sin resultados tras {wp_timeout}s. Prueba con --deep "
-                    "(más timeout) o revisa la conexión al target.",
-                    module="wordpress",
-                )
-                if verbose:
-                    console.print(f"[yellow][-] wpscan: timeout a los {wp_timeout}s, sin resultados[/yellow]")
-            elif host.wordpress.get("error"):
+            #
+            # "error" (incluye el autoaborto de wpscan, p. ej. por redirect) es
+            # excluyente: si wpscan decidió que no pudo escanear de verdad, eso
+            # manda aunque haya impreso algo de texto. "timed_out" en cambio NO
+            # es excluyente con tener "raw": un timeout que SÍ capturó salida
+            # real antes del corte se procesa igual que un escaneo completo,
+            # solo que avisando de que es parcial — antes se tiraba esa salida
+            # entera por error (ver `run_wpscan`).
+            raw = host.wordpress.get("raw", "")
+            if host.wordpress.get("error"):
                 host.add_finding(
                     "wpscan falló", Severity.INFO, host.wordpress["error"], module="wordpress",
                 )
                 if verbose:
                     console.print(f"[yellow][-] wpscan: {host.wordpress['error']}[/yellow]")
             else:
-                raw = host.wordpress.get("raw", "")
+                if host.wordpress.get("timed_out"):
+                    detail = (
+                        f"Se agotó el tiempo ({wp_timeout}s) " +
+                        ("pero se capturó salida parcial antes del corte — ver detalle abajo."
+                         if raw else "sin ninguna salida capturada.") +
+                        " Prueba con --deep (más timeout) o revisa la conexión al target."
+                    )
+                    host.add_finding("wpscan se agotó por tiempo", Severity.INFO, detail, module="wordpress")
+                    if verbose:
+                        estado = "con salida parcial" if raw else "sin resultados"
+                        console.print(f"[yellow][-] wpscan: timeout a los {wp_timeout}s, {estado}[/yellow]")
+
                 if verbose:
                     if raw:
                         console.print(f"[green][+] wpscan: {len(raw.splitlines())} líneas de salida (ver reporte)[/green]")
-                    else:
+                    elif not host.wordpress.get("timed_out"):
                         console.print("[dim]  wpscan: sin hallazgos relevantes en modo passive[/dim]")
 
                 # Clasificación de usuarios/backups en hallazgos reales,
@@ -477,6 +495,12 @@ def run_phase2(client: HttpClient, result: ScanResult, subdomain_mode: bool,
 
     result.robots_paths = parse_robots(client, f"{protocol}://{result.target}")
 
+    root_takeover = takeover.check_host(client, result.target)
+    if root_takeover:
+        root_host.findings.append(root_takeover)
+        posture.compute_score(root_host)
+        console.print(f"[bold red][!] {root_takeover.title}[/bold red]")
+
     if subdomain_mode:
         return
 
@@ -502,12 +526,40 @@ def run_phase2(client: HttpClient, result: ScanResult, subdomain_mode: bool,
     )
     console.print(f"[green][+] {len(result.subdomains_alive)} subdominios vivos[/green]")
 
+    with (
+        console.status(
+            f"[blue]Evaluando subdomain takeover en {len(result.subdomains_merged)} "
+            "subdominios...[/blue]"
+        ),
+        ThreadPoolExecutor(max_workers=10) as pool,
+    ):
+        futures = {
+            pool.submit(takeover.check_host, client, sub): sub
+            for sub in result.subdomains_merged
+        }
+        for future in as_completed(futures):
+            sub = futures[future]
+            finding = future.result()
+            if finding:  # asignación a result.hosts en el hilo principal
+                host = result.get_or_create_host(sub)
+                host.findings.append(finding)
+                posture.compute_score(host)
+                console.print(f"[bold red][!] {finding.title}[/bold red]")
+
     if not result.subdomains_alive:
         return
 
     console.rule("Comparación de postura de seguridad")
     if use_nuclei:
         console.print("[dim]  (nuclei solo se ejecuta sobre el dominio raíz)[/dim]")
+    # Un subdominio puede tener YA un hallazgo de takeover (y por tanto un
+    # HostResult provisional en result.hosts) y además responder a HTTP, con
+    # lo que también pasa por evaluate_host completo. Sin esto, la línea de
+    # abajo lo sobrescribiría y se perdería el hallazgo de takeover.
+    pending_findings = {
+        h: list(result.hosts[h].findings)
+        for h in result.subdomains_alive if h in result.hosts
+    }
     with (
         console.status(f"[cyan]Evaluando {len(result.subdomains_alive)} subdominios en paralelo...[/cyan]"),
         ThreadPoolExecutor(max_workers=6) as pool,
@@ -518,6 +570,10 @@ def run_phase2(client: HttpClient, result: ScanResult, subdomain_mode: bool,
         }
         for future in as_completed(futures):
             host = future.result()
+            extra = pending_findings.get(host.hostname)
+            if extra:
+                host.findings.extend(extra)
+                posture.compute_score(host)
             result.hosts[host.hostname] = host
             console.print(f"[dim]  ✓ {host.hostname} (score {host.score})[/dim]")
 
@@ -557,25 +613,21 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("-s", "--subdomain", action="store_true",
                          help="Modo subdominio: omite WHOIS/DNS extra/descubrimiento")
     parser.add_argument("-d", "--deep", action="store_true",
-                         help="Modo intensivo: wordlist grande (big.txt), wpscan en "
-                              "modo mixed, y activa nuclei automáticamente")
+                         help="Modo intensivo: wordlist grande, wpscan mixed y nuclei automático")
     parser.add_argument("--nuclei", action="store_true",
-                         help="Ejecuta nuclei sobre el dominio raíz (ruidoso; no se "
-                              "activa por defecto). Implícito si se usa -d/--deep")
+                         help="Ejecuta nuclei sobre el dominio raíz (ruidoso). "
+                              "Implícito con -d/--deep")
+    parser.add_argument("--no-osv", action="store_true",
+                         help="Desactiva la consulta a OSV.dev. Útil en redes air-gapped/offline")
     parser.add_argument("--active-probes", action="store_true",
-                         help="Sondas de DETECCIÓN activa (SQLi/XSS/SSTI/IDOR/SSRF) contra los "
-                              "parámetros descubiertos. Nunca por defecto; eje independiente de "
-                              "-d/--deep. Nunca marca nada como explotado, solo como señal a "
-                              "verificar manualmente")
+                         help="Sondas de detección activa (SQLi/XSS/SSTI/IDOR/SSRF/open "
+                              "redirect/LFI). Nunca marca nada como explotado")
     parser.add_argument("--param", type=active_probes.argparse_param, metavar='"URL?PARAM="',
-                         help="Modo manual de --active-probes: apunta solo a esta URL/parámetro "
-                              "(ej. --param \"https://target.com/search?q=\"), en vez de usar los "
-                              "endpoints descubiertos automáticamente. Implica --active-probes")
+                         help="Ejecuta --active-probes apuntando solo a esta URL/parámetro "
+                              "(ej. \"https://target.com/search?q=\")")
     parser.add_argument("--cookie", type=argparse_cookie, metavar='"NOMBRE=VALOR; ..."',
-                         help="Recon autenticado: cookies de sesión a enviar al objetivo "
-                              "(solo al dominio objetivo y subdominios). Los valores nunca "
-                              "se guardan en los reportes. Ojo: quedan en el historial del "
-                              "shell y en la lista de procesos mientras corren ffuf/nuclei/wpscan")
+                         help="Recon autenticado: cookies de sesión a enviar al objetivo. "
+                              "No aparecen en los reportes")
     return parser
 
 
@@ -635,7 +687,7 @@ def render_summary(result: ScanResult) -> None:
         for hostname, finding in high:
             console.print(
                 f"  [bold]{finding.severity.value.upper()}[/bold] "
-                f"{finding.title} [dim]({hostname})[/dim]"
+                f"{finding.title} [dim]({hostname}, confianza: {finding.confidence.value})[/dim]"
             )
     else:
         console.print("\n[green]Sin hallazgos HIGH/CRITICAL[/green]")
@@ -650,19 +702,30 @@ def render_summary(result: ScanResult) -> None:
         if not host.wordpress:
             continue
         wp = host.wordpress
-        if wp.get("error") or wp.get("timed_out"):
-            status = wp.get("error") or f"timeout a los {config.WPSCAN_TIMEOUT_DEFAULT}s"
-            console.print(f"\n[yellow]WordPress ({hostname}): wpscan no completó — {status}[/yellow]")
+        if wp.get("error"):
+            console.print(f"\n[yellow]WordPress ({hostname}): wpscan no completó — {wp['error']}[/yellow]")
         elif wp.get("raw"):
+            parcial = " (parcial, se agotó el tiempo antes de terminar)" if wp.get("timed_out") else ""
             console.print(
-                f"\n[bold]WordPress ({hostname}):[/bold] wpscan generó salida "
+                f"\n[bold]WordPress ({hostname}):[/bold] wpscan generó salida{parcial} "
                 f"— ver wordpress.txt / reporte_final.md para detalle "
                 f"(usuarios/plugins no se parsean aún de forma estructurada)"
             )
+        elif wp.get("timed_out"):
+            console.print(
+                f"\n[yellow]WordPress ({hostname}): wpscan no completó — "
+                f"timeout a los {config.WPSCAN_TIMEOUT_DEFAULT}s[/yellow]"
+            )
 
 def main() -> None:
-    args = build_argparser().parse_args()
+    # El banner va ANTES de parsear: si falta `target` o se pasa -h/--help,
+    # argparse corta la ejecución dentro de parse_args() y nunca llegaría
+    # a imprimirse si estuviera después.
     print_banner()
+    args = build_argparser().parse_args()
+
+    if args.no_osv:
+        config.OSV_ENABLED = False
 
     auth = args.cookie  # None si no se pasó --cookie
     client = HttpClient(auth=auth, scope_domain=args.target if auth else None)

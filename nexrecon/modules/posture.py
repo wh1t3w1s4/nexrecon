@@ -16,7 +16,7 @@ esas carencias se ponderan a la mitad en vez de contarse enteras.
 from __future__ import annotations
 
 from .. import config
-from ..models import SEVERITY_RANK, Finding, HostResult, ScanResult, Severity
+from ..models import SEVERITY_RANK, Confidence, Finding, HostResult, ScanResult, Severity
 from .searchsploit_scan import count_exploits
 
 _SEVERITY_PENALTY = {
@@ -31,6 +31,16 @@ _MAX_BONUS = 30
 _MAX_PENALTY = -55
 _DAMPED_SEVERITIES = (Severity.MEDIUM, Severity.LOW)
 _DAMPED_MODULES = ("headers",)
+
+# CERTAIN y FIRM pesan igual (= sin cambio para los hallazgos ya existentes,
+# que por defecto son FIRM); solo TENTATIVE suaviza el score, para que un
+# indicio heurístico (candidato SSRF, secreto genérico...) no lo hunda igual
+# que algo confirmado. Pesos ajustables, por eso están aparte y no en línea.
+_CONFIDENCE_WEIGHT = {
+    Confidence.CERTAIN: 1.0,
+    Confidence.FIRM: 1.0,
+    Confidence.TENTATIVE: 0.5,
+}
 
 
 def _csp(host: HostResult) -> str:
@@ -75,8 +85,9 @@ def compute_score(host: HostResult) -> int:
             continue
         if host.waf and finding.module in _DAMPED_MODULES and finding.severity in _DAMPED_SEVERITIES:
             value //= 2
+        value = round(value * _CONFIDENCE_WEIGHT.get(finding.confidence, 1.0))
         penalty += value
-        breakdown.append((finding.title, value))
+        breakdown.append((f"{finding.title} ({finding.confidence.value})", value))
 
     if penalty < _MAX_PENALTY:
         breakdown.append(("techo de penalización", _MAX_PENALTY - penalty))

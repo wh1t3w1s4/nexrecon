@@ -95,3 +95,32 @@ def test_missing_rc_files_dont_crash(monkeypatch):
     monkeypatch.setattr(ss, "_COMMON_PATHS", ())
     monkeypatch.setattr(ss, "_SHELL_RC_FILES", ("~/.this_file_does_not_exist_nexrecon_test",))
     assert ss._resolve_path() is None
+
+
+def test_confirmed_finding_is_firm_and_unconfirmed_is_tentative(monkeypatch):
+    from nexrecon.models import Confidence, HostResult, VulnMatch
+    from nexrecon.modules import searchsploit_scan as ss
+
+    monkeypatch.setattr(ss, "searchsploit_available", lambda: True)
+
+    def fake_search_by_cve(cve, timeout=30):
+        return [{"EDB-ID": "111", "Title": "Confirmado por CVE", "Type": "webapps"}]
+
+    def fake_search_by_term(term, timeout=30):
+        return [{"EDB-ID": "222", "Title": "Sin confirmar por texto", "Type": "webapps"}]
+
+    monkeypatch.setattr(ss, "search_by_cve", fake_search_by_cve)
+    monkeypatch.setattr(ss, "search_by_term", fake_search_by_term)
+
+    host = HostResult(hostname="t.example")
+    host.vulns = [VulnMatch(technology="jQuery", detected_version="1.0", fixed_in="3.5.0",
+                            cve="CVE-2020-11022", description="d", reference="r")]
+    host.technologies = {"jQuery": "1.0"}
+
+    findings = ss.gather_exploits_for_host(host)
+    confirmed = next(f for f in findings if f.title.startswith(ss.TAG_CONFIRMED))
+    unconfirmed = next(f for f in findings if f.title.startswith(ss.TAG_UNCONFIRMED))
+
+    assert confirmed.confidence == Confidence.FIRM
+    assert unconfirmed.confidence == Confidence.TENTATIVE
+    assert confirmed.confidence != unconfirmed.confidence

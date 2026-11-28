@@ -12,15 +12,24 @@ como tarea manual del usuario, tal como se pidió explícitamente.
 Objetivos: `host.endpoints` (de `endpoint_discovery`) o, en modo manual,
 un único `Endpoint` construido desde `--param "https://target.com/search?q="`.
 
-Técnicas y severidad acordadas:
-  - SSTI  ({{7*7}} -> 49, confirmado con una segunda expresión): CRITICAL
-  - SQLi  (comilla simple + error de BD visible):                HIGH
-  - XSS   (marcador único reflejado sin escapar):                HIGH
-  - IDOR  (ID vecino con respuesta distinta y sin señal de error): MEDIUM/HIGH
-          (HIGH si la sesión venía de --cookie: ahí sí hay control de acceso
-          real que comprobar, no solo una respuesta curiosa sin sesión).
-  - SSRF  (solo nombre/valor de parámetro con forma de URL, SIN payload
-          activo salvo que el propio usuario use un receptor OOB a mano): INFO/LOW
+Cada hallazgo lleva también `confidence` (ver `models.Confidence`), un eje
+independiente de la severidad: cuánto nos fiamos de la señal, no cuánto
+importaría si fuera real.
+
+Técnicas, severidad y confianza acordadas:
+  - SSTI    ({{7*7}} -> 49, confirmado con una segunda expresión,          CRITICAL / CERTAIN
+            varios motores de plantillas — ver `_SSTI_STYLES`)
+  - SQLi    (comilla simple + error de BD visible o 500 nuevo)             HIGH / FIRM
+  - XSS     (marcador único reflejado sin escapar, varias variantes)       HIGH / FIRM
+  - IDOR    (ID vecino con respuesta distinta y sin señal de error)        MEDIUM/HIGH, TENTATIVE/FIRM
+            (HIGH+FIRM si la sesión venía de --cookie: ahí sí hay control de
+            acceso real que comprobar, no solo una respuesta curiosa sin sesión)
+  - Open redirect (canario externo en parámetros con forma de redirect,   MEDIUM/HIGH, CERTAIN
+            sin seguir la redirección; HIGH si el parámetro es OAuth-like)
+  - LFI/path traversal (firma de /etc/passwd o windows/win.ini ausente     HIGH / CERTAIN
+            en la respuesta base)
+  - SSRF    (solo nombre/valor de parámetro con forma de URL, SIN payload  INFO/LOW, TENTATIVE
+            activo salvo que el propio usuario use un receptor OOB a mano)
 
 Primer filtro, pensado para iterar con uso real en labs (pentest-tools,
 PortSwigger): heurísticas simples, no un motor de reglas completo.
@@ -34,7 +43,7 @@ import uuid
 from urllib.parse import urlparse
 
 from ..http_client import FetchResult, HttpClient
-from ..models import Endpoint, Finding, HostResult, Severity
+from ..models import Confidence, Endpoint, Finding, HostResult, Severity
 from .endpoint_discovery import endpoint_from_url
 
 MODULE_NAME = "active_probes"
@@ -103,11 +112,12 @@ def argparse_param(raw: str) -> Endpoint:
     return ep
 
 
-def _finding(title: str, severity: Severity, ep: Endpoint, param: str, detail: str) -> Finding:
+def _finding(title: str, severity: Severity, ep: Endpoint, param: str, detail: str,
+            confidence: Confidence = Confidence.FIRM) -> Finding:
     return Finding(
         title=title, severity=severity,
         detail=f"{ep.method} {ep.url} (parámetro: {param}, origen: {ep.source}). {detail}",
-        module=MODULE_NAME,
+        module=MODULE_NAME, confidence=confidence,
     )
 
 
@@ -197,6 +207,7 @@ def _probe_ssti(client: HttpClient, ep: Endpoint, name: str, value: str,
                 "plantilla abierta por la propia app (p. ej. necesitas cerrarla con '}}' "
                 "antes de la tuya), esta sonda no lo detecta — es un caso específico del "
                 "lab/app, no genérico.",
+                confidence=Confidence.CERTAIN,
             )]
     return []
 
@@ -213,6 +224,7 @@ def _probe_idor(client: HttpClient, ep: Endpoint, baseline: FetchResult,
                 or res.text == baseline.text or _DENY_PATTERNS.search(res.text)):
             continue
         severity = Severity.HIGH if authenticated else Severity.MEDIUM
+        confidence = Confidence.FIRM if authenticated else Confidence.TENTATIVE
         findings.append(_finding(
             f"Posible IDOR en parámetro '{name}'", severity, ep, name,
             f"Cambiar {name}={value} por {name}={neighbor} devolvió 200 con un cuerpo "
@@ -222,6 +234,7 @@ def _probe_idor(client: HttpClient, ep: Endpoint, baseline: FetchResult,
             + (" Sesión autenticada (--cookie): si el objeto pertenece a otra cuenta, "
                "es un control de acceso roto confirmable de inmediato." if authenticated else
                " Sin sesión activa: confirma primero si el recurso debería requerir login."),
+            confidence=confidence,
         ))
     return findings
 
@@ -247,8 +260,85 @@ def _probe_ssrf_candidates(ep: Endpoint) -> list[Finding]:
             "activo (solo detección estática del candidato). Para confirmar, usa "
             "manualmente un receptor OOB propio (p. ej. requestrepo.com o interactsh) "
             "— esta herramienta no lo hace por ti.",
+            confidence=Confidence.TENTATIVE,
         ))
     return findings
+
+
+# ------------------------------------------------------- open redirect
+
+_REDIRECT_PARAM = re.compile(
+    r"(?i)^(?:url|uri|redirect|redirect_uri|return|returnurl|returnto|"
+    r"goto|next|dest|destination|continue|r|u|target|callback)$"
+)
+# .invalid es el TLD reservado para esto (RFC 2606): nunca resuelve, nunca
+# se visita de verdad — el canario es inerte incluso si algo lo siguiera.
+_REDIRECT_CANARY = "nxr-redirect.invalid"
+_OAUTH_LIKE_PARAMS = {"redirect_uri", "returnurl", "callback"}
+
+
+def _send_no_redirect(client: HttpClient, ep: Endpoint, params: dict[str, str]) -> FetchResult | None:
+    if ep.method == "POST":
+        res = client.post(ep.url, data=params, allow_redirects=False, timeout=PROBE_TIMEOUT)
+    else:
+        res = client.request("GET", ep.url, params=params, allow_redirects=False, timeout=PROBE_TIMEOUT)
+    return res if res.ok else None
+
+
+def _probe_open_redirect(client: HttpClient, ep: Endpoint, name: str, value: str,
+                         _baseline: FetchResult) -> list[Finding]:
+    if not _REDIRECT_PARAM.match(name):
+        return []
+    for payload in (f"https://{_REDIRECT_CANARY}/", f"//{_REDIRECT_CANARY}/"):
+        res = _send_no_redirect(client, ep, {**ep.params, name: payload})
+        if not res:
+            continue
+        location = {k.lower(): v for k, v in (res.headers or {}).items()}.get("location", "")
+        if 300 <= res.status_code < 400 and _REDIRECT_CANARY in urlparse(location).netloc:
+            severity = Severity.HIGH if name.lower() in _OAUTH_LIKE_PARAMS else Severity.MEDIUM
+            return [_finding(
+                f"Open redirect en parámetro '{name}'", severity, ep, name,
+                f"Con el valor '{payload}', la respuesta ({res.status_code}) trae "
+                f"Location: {location!r}, apuntando al canario externo. No se siguió la "
+                "redirección; verificar manualmente el impacto (phishing, robo de token "
+                "en flujos OAuth si el parámetro es de ese tipo).",
+                confidence=Confidence.CERTAIN,
+            )]
+    return []
+
+
+# --------------------------------------------------------- LFI / traversal
+
+_LFI_PASSWD_RE = re.compile(r"root:.*?:0:0:", re.MULTILINE)
+_LFI_WININI_RE = re.compile(r"\[extensions\]|for 16-bit app support", re.IGNORECASE)
+_LFI_PAYLOADS = (
+    "../../../../../../etc/passwd",
+    "....//....//....//....//etc/passwd",                 # bypass de filtro simple de "../"
+    "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",    # URL-encoded
+    "../../../../../../windows/win.ini",
+)
+# Deliberadamente SIN payloads de null-byte (%00): técnica obsoleta en
+# intérpretes modernos y solo añade ruido.
+
+
+def _probe_lfi(client: HttpClient, ep: Endpoint, name: str, value: str,
+               baseline: FetchResult) -> list[Finding]:
+    for payload in _LFI_PAYLOADS:
+        res = _send(client, ep, {**ep.params, name: payload})
+        if not res:
+            continue
+        got_passwd = bool(_LFI_PASSWD_RE.search(res.text)) and not _LFI_PASSWD_RE.search(baseline.text)
+        got_wini = bool(_LFI_WININI_RE.search(res.text)) and not _LFI_WININI_RE.search(baseline.text)
+        if got_passwd or got_wini:
+            target = "/etc/passwd" if got_passwd else "windows/win.ini"
+            return [_finding(
+                f"Posible LFI/Path Traversal en parámetro '{name}'", Severity.HIGH, ep, name,
+                f"El payload '{payload}' devolvió contenido de {target} ausente en la "
+                "respuesta base. Verificar manualmente; no se ha extraído ningún fichero "
+                "más allá de confirmar la firma en la respuesta.",
+                confidence=Confidence.CERTAIN,
+            )]
+    return []
 
 
 # ----------------------------------------------------------------- runner
@@ -277,6 +367,8 @@ def probe_endpoint(client: HttpClient, ep: Endpoint, authenticated: bool) -> lis
         findings += _probe_sqli(client, ep, name, value, baseline)
         findings += _probe_xss(client, ep, name, value, baseline)
         findings += _probe_ssti(client, ep, name, value, baseline)
+        findings += _probe_open_redirect(client, ep, name, value, baseline)
+        findings += _probe_lfi(client, ep, name, value, baseline)
     findings += _probe_idor(client, ep, baseline, authenticated)
     return findings
 
